@@ -1,11 +1,12 @@
+import io
 import json
 import urllib.request
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from PIL import Image
-import torch
-from torchvision import models, transforms
-import io
+
 import mlflow
+import torch
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from PIL import Image
+from torchvision import models, transforms
 
 app = FastAPI()
 
@@ -54,7 +55,8 @@ async def predict(file: UploadFile = File(...)):
     try:
         image = Image.open(io.BytesIO(image_data)).convert("RGB")
     except Exception:
-        raise HTTPException(400, "invalid image")
+        raise HTTPException(400, "invalid image") from None
+    
 
     # 前処理と推論
     input_tensor = preprocess(image)
