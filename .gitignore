@@ -1,0 +1,39 @@
+# --- System / IDE ---
+.DS_Store
+.idea/
+
+# --- Python ---
+__pycache__/
+*.pyc
+
+# --- Garbage / Installers ---
+*.pkg
+*.dmg
+
+# --- MLflow & Data (絶対コミットしてはいけないもの) ---
+# 実験記録。サーバー(MinIO/DB)を使うならローカルのこれは不要。
+mlruns/
+.trash/
+
+# MinIOの永続化データ。これを上げるとバイナリデータの塊をGitで管理する地獄を見る。
+minio_data/
+
+# 仮想環境 (もし今後作るなら)
+venv/
+.venv/
+env/
+
+# DB
+*.db
+
+# --- 環境変数（絶対にコミットしない） ---
+.env
+.env.*
+!.env.example
+
+# --- その他 ---
+*.code-workspace
+debug.txt
+hello.txt
+mlflow_db*/
+

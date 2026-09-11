@@ -1,0 +1,10 @@
+{
+    "name": "my-ml",
+    "dockerComposeFile": ["../docker-compose.yaml"],
+    "service": "ml-app",
+    "workspaceFolder": "/app",
+    "features": {
+        "ghcr.io/devcontainers/features/aws-cli:1": {},
+        "ghcr.io/devcontainers/features/git:1": {}
+    }
+}
