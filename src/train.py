@@ -1,6 +1,8 @@
 """コスト異常検知モデルを学習し、MLflow Model Registry に登録する。"""
 
 import argparse
+import json
+import tempfile
 from pathlib import Path
 
 import mlflow
@@ -14,6 +16,8 @@ from sklearn.metrics import (
     recall_score,
 )
 from sklearn.model_selection import train_test_split
+
+from src.baseline import compute_baseline
 
 FEATURES = [
     "cost",
@@ -70,6 +74,13 @@ def main() -> None:
             "average_precision": average_precision_score(y_test, y_proba),
         }
         mlflow.log_metrics(metrics)
+
+        baseline = compute_baseline(X_train, FEATURES)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = f"{tmp}/baseline.json"
+            with open(path, "w") as f:
+                json.dump(baseline, f, indent=2)
+            mlflow.log_artifact(path)
 
         mlflow.sklearn.log_model(
             clf,
