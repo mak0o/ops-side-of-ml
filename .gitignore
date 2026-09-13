@@ -36,4 +36,5 @@ env/
 debug.txt
 hello.txt
 mlflow_db*/
-
+data/
+.vscode/

@@ -1,11 +1,9 @@
---index-url https://download.pytorch.org/whl/cpu
---extra-index-url https://pypi.org/simple
-
 fastapi
 uvicorn
-torch
-torchvision
-pillow
-python-multipart
+pydantic
+pandas
+pyarrow
+numpy
+scikit-learn
 mlflow==3.16.0
 boto3
