@@ -255,3 +255,15 @@ SageMaker Model Registry の approval status が同じ役割を果たすので�
 - [ ] AWS (SageMaker) への移行
 - [ ] 判定閾値の最適化とモデルへの記録
 - [ ] 学習ウィンドウの自動決定
+
+## 補足
+
+### MinIO のイメージ取得元
+
+MinIO は 2026 年 9 月に Docker Hub から `minio/minio` と `minio/mc` を削除した。
+Docker Hub は匿名 pull に 401 を返すため `pull access denied ... may require 'docker login'` という認証エラー風のメッセージが出るが、認証の問題ではなくリポジトリ自体が存在しない。
+
+現在の公式配布元は quay.io。
+
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    image: quay.io/minio/mc
