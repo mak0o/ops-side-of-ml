@@ -12,6 +12,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     average_precision_score,
     f1_score,
+    fbeta_score,
     precision_score,
     recall_score,
 )
@@ -71,6 +72,7 @@ def main() -> None:
             "precision": precision_score(y_test, y_pred, zero_division=0),
             "recall": recall_score(y_test, y_pred, zero_division=0),
             "f1": f1_score(y_test, y_pred, zero_division=0),
+            "f2": fbeta_score(y_test, y_pred, beta=2, zero_division=0),
             "average_precision": average_precision_score(y_test, y_proba),
         }
         mlflow.log_metrics(metrics)
