@@ -21,6 +21,30 @@ def get_metrics(client: mlflow.MlflowClient, run_id: str) -> dict:
     return client.get_run(run_id).data.metrics
 
 
+def evaluate(current: dict | None, candidate: dict,
+             min_precision: float, min_recall: float) -> list[tuple[str, bool, str]]:
+    """昇格可否のチェック結果を返す。MLflow に依存しない純粋関数。"""
+    checks = []
+
+    if current is None:
+        checks.append(("baseline", True, "現行モデルなし、初回昇格"))
+    else:
+        base = current[PRIMARY_METRIC]
+        cand_score = candidate[PRIMARY_METRIC]
+        checks.append((
+            PRIMARY_METRIC, cand_score > base,
+            f"{base:.3f} -> {cand_score:.3f} ({cand_score - base:+.3f})",
+        ))
+
+    p = candidate.get("precision", 0.0)
+    checks.append(("precision", p >= min_precision, f"{p:.3f} >= {min_precision:.2f}"))
+
+    r = candidate.get("recall", 0.0)
+    checks.append(("recall", r >= min_recall, f"{r:.3f} >= {min_recall:.2f}"))
+
+    return checks
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--candidate", type=int, required=True,
@@ -43,7 +67,6 @@ def main() -> None:
     except Exception:
         curr, current_version = None, None
 
-
     def fmt(metrics: dict, key: str) -> str:
         return f"{metrics[key]:.3f}" if key in metrics else "n/a"
 
@@ -61,11 +84,7 @@ def main() -> None:
           f"recall={fmt(cand, 'recall')}")
     print()
 
-    checks = []
-
-    if curr is None:
-        checks.append(("baseline", True, "現行モデルなし、初回昇格"))
-    else:
+    if curr is not None:
         if PRIMARY_METRIC not in curr:
             print(f"ERROR: 現行モデル v{current_version} に "
                   f"'{PRIMARY_METRIC}' が記録されていません。")
@@ -76,21 +95,7 @@ def main() -> None:
                   f"'{PRIMARY_METRIC}' が記録されていません。")
             raise SystemExit(2)
 
-        base = curr[PRIMARY_METRIC]
-        cand_score = cand[PRIMARY_METRIC]
-        improved = cand_score > base
-        checks.append((
-            PRIMARY_METRIC, improved,
-            f"{base:.3f} -> {cand_score:.3f} ({cand_score - base:+.3f})",
-        ))
-
-    p = cand.get("precision", 0.0)
-    checks.append(("precision", p >= args.min_precision,
-                   f"{p:.3f} >= {args.min_precision:.2f}"))
-
-    r = cand.get("recall", 0.0)
-    checks.append(("recall", r >= args.min_recall,
-                   f"{r:.3f} >= {args.min_recall:.2f}"))
+    checks = evaluate(curr, cand, args.min_precision, args.min_recall)
 
     for name, ok, detail in checks:
         print(f"{name:<12} {detail:<30} {'PASS' if ok else 'FAIL'}")

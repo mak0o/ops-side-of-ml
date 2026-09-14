@@ -3,5 +3,5 @@ target-version = "py312"
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "B", "UP"]
-ignore = ["B008"]  # FastAPI の Depends/File は引数デフォルトで使うのが正しい
+select = ["E", "F", "I", "B", "UP", "RET"]
+ignore = ["B008"]  # FastAPI の File/Depends は引数デフォルトで使うのが正しい
