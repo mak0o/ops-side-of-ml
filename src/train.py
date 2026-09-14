@@ -40,9 +40,19 @@ def main() -> None:
     parser.add_argument("--max-depth", type=int, default=8)
     parser.add_argument("--register", action="store_true",
                         help="Model Registry に登録する")
+    parser.add_argument("--since", type=str, default=None,
+                        help="この日付以降のデータのみで学習する（例: 2025-11-01）")
     args = parser.parse_args()
 
     df = pd.read_parquet(args.data)
+
+    if args.since:
+        before = len(df)
+        df = df[df["date"] >= pd.Timestamp(args.since)]
+        print(f"window: {args.since} 以降に絞り込み ({before} -> {len(df)} rows)")
+        if df.empty:
+            raise SystemExit("指定期間にデータがありません")
+
     X_train, X_test, y_train, y_test = train_test_split(
         df[FEATURES], df[TARGET], test_size=0.2, random_state=42, stratify=df[TARGET]
     )
@@ -55,6 +65,7 @@ def main() -> None:
             "max_depth": args.max_depth,
             "n_train": len(X_train),
             "anomaly_rate": float(df[TARGET].mean()),
+            "since": args.since or "all",
         })
 
         clf = RandomForestClassifier(

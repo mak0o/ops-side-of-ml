@@ -59,7 +59,7 @@ def main() -> None:
 
     if logs.empty:
         print("no inference logs found")
-        return
+        raise SystemExit(2)
 
     print(f"baseline: {baseline['n_samples']} samples")
     print(f"current:  {len(logs)} samples")
@@ -84,9 +84,8 @@ def main() -> None:
     print()
     if drifted:
         print(f"DRIFT DETECTED: {', '.join(drifted)}")
-        print("再学習を検討してください。")
-    else:
-        print("no significant drift")
+        raise SystemExit(1)
+    print("no significant drift")
 
 
 if __name__ == "__main__":

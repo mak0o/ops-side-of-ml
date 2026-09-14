@@ -81,16 +81,34 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--days", type=int, default=365)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--drift", type=float, default=1.0,
-                        help="コスト水準の倍率。1.0 以外にするとドリフトしたデータになる")
+    parser.add_argument(
+        "--drift", type=float, default=1.0,
+        help="コスト水準の倍率。1.0以外でドリフトしたデータになる",
+    )
     parser.add_argument("--out", type=Path, default=Path("data/cost.parquet"))
+    parser.add_argument(
+        "--append-to", type=Path, default=None,
+        help="既存データの続きとして生成し、結合したものを --out に書く",
+    )
     args = parser.parse_args()
 
-    df = add_features(generate(args.days, args.seed, args.drift))
+    raw = generate(args.days, args.seed, args.drift)
+
+    if args.append_to:
+        existing = pd.read_parquet(args.append_to)
+        start = existing["date"].max() + pd.Timedelta(days=1)
+        offset = start - raw["date"].min()
+        raw["date"] = raw["date"] + offset
+        # 特徴量は結合後の生データから計算する（移動平均が期間をまたぐため）
+        base = existing[["date", "service", "cost", "is_anomaly"]]
+        raw = pd.concat([base, raw], ignore_index=True)
+
+    df = add_features(raw)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(args.out, index=False)
 
     print(f"{len(df)} rows -> {args.out}")
+    print(f"period: {df['date'].min():%Y-%m-%d} .. {df['date'].max():%Y-%m-%d}")
     print(f"anomaly rate: {df['is_anomaly'].mean():.1%}")
 
 
