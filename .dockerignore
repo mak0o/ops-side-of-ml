@@ -1,0 +1,11 @@
+.git/
+.github/
+data/
+mlflow_db*/
+infra/.terraform/
+__pycache__/
+*.pyc
+.venv/
+tests/
+docs/
+*.md

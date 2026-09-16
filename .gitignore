@@ -38,3 +38,10 @@ hello.txt
 mlflow_db*/
 data/
 .vscode/
+# Terraform
+infra/.terraform/
+infra/*.tfstate
+infra/*.tfstate.*
+infra/*.tfvars
+!infra/*.tfvars.example
+infra/crash.log
