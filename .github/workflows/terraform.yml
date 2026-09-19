@@ -28,6 +28,18 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Debug OIDC claims
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const token = await core.getIDToken('sts.amazonaws.com');
+            const payload = JSON.parse(
+              Buffer.from(token.split('.')[1], 'base64').toString()
+            );
+            core.info('sub: ' + payload.sub);
+            core.info('aud: ' + payload.aud);
+            core.info('iss: ' + payload.iss);
+
       - uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: arn:aws:iam::320813594497:role/ops-side-of-ml-gha-plan
