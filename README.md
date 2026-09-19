@@ -244,17 +244,103 @@ SageMaker Model Registry の approval status が同じ役割を果たすので�
 | ローカル | AWS |
 |---|---|
 | MinIO | S3 |
-| MLflow server | SageMaker managed MLflow |
+| MLflow server | 使わない（ローカル専用。理由は AWS 側の設計判断を参照） |
 | Model Registry alias | SageMaker Model Registry approval status |
 | FastAPI (Docker) | SageMaker Serverless Inference |
-| `drift_check.py` | SageMaker Model Monitor、または同じコードを Lambda で実行 |
+| `drift_check.py` | Lambda（Serverless Inference では Model Monitor が使えない） |
 | `retrain_pipeline.sh` | SageMaker Pipelines + EventBridge |
+
+## AWS 側の設計判断
+
+### managed MLflow は使わない
+
+移行表では MLflow server を SageMaker managed MLflow に対応させているが、実際には採用しない。
+
+トラッキングサーバーは起動している限り課金が続く。Small サイズで us-east-1 が $0.642/時、フランクフルトが $0.886/時。月額にすると $500〜650 になる。torch を外してイメージを削り、表形式データを選んで学習コストを抑えた判断が、これ一つで帳消しになる。
+
+AWS 側では SageMaker Model Registry の approval status を使う。MLflow の alias で設計してあるので読み替えは容易で、追加コストはゼロ。MLflow はローカル専用と割り切る。
+
+### Serverless Inference では Model Monitor が使えない
+
+Serverless Inference は、GPU、VPC 構成、マルチモデルエンドポイント、**データキャプチャ、Model Monitor** が機能除外になっている。
+
+つまりドリフト監視は自前で組む必要がある。推論ログを MLflow に書かず JSON Lines を S3 に吐く設計にしたのは、結果としてこの制約下での唯一の解になっていた。`drift_check.py` は Lambda で実行する。
+
+### state バケットを artifacts と分ける
+
+Terraform の state は `ops-side-of-ml-tfstate` に置き、artifacts バケットとは別にしている。同居させない理由は3つ。
+
+- artifacts バケットは Terraform の管理対象なので、`destroy` を打つと state ごと消しにいく
+- state にはバージョニングが要る（破損時の復旧手段がこれしかない）が、artifacts に付けると推論ログの全世代が残り続けて費用方針と衝突する
+- ライフサイクルの prefix を将来広げたとき、state が削除対象に入る
+
+バケットを増やしても課金は増えない。S3 の料金は容量とリクエストに対するもので、バケット数は無料。
+
+### DynamoDB によるロックは使わない
+
+Terraform 1.10 以降、S3 バックエンドは `use_lockfile = true` でロックが取れる。DynamoDB テーブルは不要。
+
+ネット上の記事は大半が DynamoDB 前提のままなので、参照するときは対象バージョンを確認する必要がある。
+
+### bootstrap だけローカル state
+
+`infra/bootstrap/` は state バケット自身を作る構成なので、その state を作成先のバケットに置くことはできない。ここだけローカル state のままにして循環を断っている。
+
+管理対象はバケット1つなので、state を失っても `import` で復旧できる。一度作れば以降ほぼ触らない。
+
+### plan と apply でロールを分ける
+
+GitHub Actions からは OIDC でロールを引く。アクセスキーはリポジトリにもシークレットにも置かない。
+
+| ロール | 引ける条件 | 権限 |
+| --- | --- | --- |
+| `gha-plan` | このリポジトリの任意のワークフロー | ReadOnlyAccess + state バケット書き込み |
+| `gha-apply` | main への push のみ | 管理対象リソースの作成・変更 |
+
+plan ロールにも state への書き込み権限がある。`terraform plan` は refresh で state を更新するため。
+
+plan ロールの `sub` 条件はブランチを限定せず `repo:<repo>:*` にしている。PR は任意のブランチから作られるため。フォークからの PR には `id-token: write` が付与されないので、外部の第三者は引けない。安全性を担保しているのは権限が ReadOnly に限られていることであって、ブランチ条件ではない。
+
+なお `ReadOnlyAccess` は S3 オブジェクトの中身まで読める。現在は合成データと state しかないので許容しているが、実データを置く段階では見直しが要る。
+
+### apply ロールは実質的な特権ロール
+
+`gha-apply` の IAM 権限は `ops-side-of-ml-*` というロール名プレフィクスに絞ってあるが、**これは権限昇格を防いでいない**。そのプレフィクスの名前でロールを作り、任意のポリシーをアタッチできるため。
+
+実際に効いている防御は次の2つ。
+
+- OIDC の `sub` 条件により main への push でしかロールを引けない
+- ブランチ保護により main への直接 push が禁止されている
+
+つまり**ブランチ保護が外れた瞬間にこの構成は崩れる**。IAM を絞ったから安全、という読み方は誤り。
+
+完全に塞ぐには apply を手動承認にするか Permissions Boundary を噛ませる必要があるが、この規模では過剰と判断して採らなかった。
+
+### OIDC の sub には ID が埋め込まれる
+
+信頼ポリシーの `sub` は次の形式になっている。
+
+```
+repo:mak0o@36266249/ops-side-of-ml@1366131270:ref:refs/heads/main
+```
+
+`@36266249` はユーザー ID、`@1366131270` はリポジトリ ID。GitHub が OIDC トークンに不変 ID を含める設定になっている場合の形式で、リポジトリ名を変更しても条件が壊れない。
+
+多くの記事にある `repo:<owner>/<repo>:...` という形式では一致せず、`Not authorized to perform sts:AssumeRoleWithWebIdentity` になる。実際に送られている値はワークフロー内でトークンをデコードすれば確認できる。
 
 ## 今後
 
-- [ ] AWS (SageMaker) への移行
+AWS
+- [x] Terraform で S3 と IAM を構築、state を S3 バックエンドへ
+- [x] GitHub Actions から OIDC で plan / apply
+- [ ] ECR と SageMaker Training Job で学習を AWS に出す
+- [ ] Serverless Inference でエンドポイントを立てる
+- [ ] drift_check / promote を Lambda + EventBridge で自動化
+
+その他
 - [ ] 判定閾値の最適化とモデルへの記録
 - [ ] 学習ウィンドウの自動決定
+
 
 ## 補足
 
