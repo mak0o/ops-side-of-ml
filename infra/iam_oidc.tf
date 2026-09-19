@@ -10,8 +10,9 @@ resource "aws_iam_openid_connect_provider" "github" {
 }
 
 locals {
-  github_repo = "mak0o/ops-side-of-ml"
+  # OIDC の sub にはユーザー ID とリポジトリ ID が含まれる。
+  # 実際のトークンから確認した値。リネームしても不変。
+  github_repo = "mak0o@36266249/ops-side-of-ml@1366131270"
 
-  # state バケット。bootstrap で作ったものを名前で参照する。
   state_bucket_arn = "arn:aws:s3:::ops-side-of-ml-tfstate"
 }
