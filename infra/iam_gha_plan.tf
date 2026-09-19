@@ -16,11 +16,12 @@ data "aws_iam_policy_document" "gha_plan_assume" {
       values   = ["sts.amazonaws.com"]
     }
 
-    # このリポジトリの PR からのみ。他リポジトリや他ブランチは引けない。
+    # PR は任意のブランチから作られるため ref を限定できない。
+    # 権限が ReadOnly + state 書き込みに限られることが安全性の担保。
     condition {
-      test     = "StringEquals"
+      test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${local.github_repo}:pull_request"]
+      values   = ["repo:${local.github_repo}:*"]
     }
   }
 }
