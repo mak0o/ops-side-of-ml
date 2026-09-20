@@ -7,7 +7,6 @@ SageMaker が要求する /ping と /invocations を提供しつつ、
 ローカルで使っている /health と /predict も残している。
 """
 
-import json
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
