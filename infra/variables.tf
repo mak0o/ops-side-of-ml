@@ -7,3 +7,14 @@ variable "project" {
   type    = string
   default = "ops-side-of-ml"
 }
+
+variable "model_artifact_uri" {
+  type        = string
+  description = "デプロイする model.tar.gz の S3 URI。学習ジョブの成果物を明示的に指定する。"
+}
+
+variable "serve_image_tag" {
+  type        = string
+  description = "推論イメージのタグ。latest だと Terraform が変更を検知できないためコミットハッシュを推奨。"
+  default     = "latest"
+}
