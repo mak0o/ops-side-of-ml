@@ -45,5 +45,7 @@ data/
 **/*.tfstate.*
 **/*.tfvars
 !**/*.tfvars.example
+!infra/terraform.ci.tfvars
 **/crash.log
 infra/backend.hcl
+

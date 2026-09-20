@@ -52,7 +52,7 @@ jobs:
       - name: Plan
         id: plan
         working-directory: infra
-        run: terraform plan -no-color -lock=false
+        run: terraform plan -no-color -lock=false -var-file=terraform.ci.tfvars
         continue-on-error: true
 
       - name: Comment plan on PR
@@ -100,4 +100,4 @@ jobs:
 
       - name: Apply
         working-directory: infra
-        run: terraform apply -auto-approve
+        run: terraform apply -auto-approve -var-file=terraform.ci.tfvars
