@@ -101,6 +101,22 @@ services:
       - AWS_REGION=ap-northeast-1
       - AWS_PROFILE=${AWS_PROFILE}
     profiles: ["tools"]
+
+  # 6. AWS 操作用（SageMaker ジョブ起動など）
+  awscli:
+    build:
+      context: .
+      dockerfile: docker/aws.Dockerfile
+    working_dir: /work
+    volumes:
+      - .:/work
+      - ~/.aws:/root/.aws:ro
+      - ~/.aws/sso:/root/.aws/sso
+      - aws_cli_cache:/root/.aws/cli
+    environment:
+      - AWS_REGION=ap-northeast-1
+      - AWS_PROFILE=${AWS_PROFILE}
+    profiles: ["tools"]
   
 networks:
   mlflow-net:
