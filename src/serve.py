@@ -39,7 +39,7 @@ def _load_from_sagemaker() -> tuple[object, str]:
 
     # モデルと同じ tar に入っている metrics.json は学習時の情報なので
     # バージョン識別には使えない。SageMaker 側が渡す環境変数を使う。
-    version = os.getenv("MODEL_PACKAGE_VERSION", "unknown")
+    version = os.getenv("MODEL_VERSION", "unknown")
     return clf, version
 
 
@@ -65,6 +65,8 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         model_error = str(e)
         print(f"model load failed: {e}")
+        if in_sagemaker():
+            raise
 
     yield
 
