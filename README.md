@@ -328,6 +328,20 @@ repo:mak0o@36266249/ops-side-of-ml@1366131270:ref:refs/heads/main
 
 多くの記事にある `repo:<owner>/<repo>:...` という形式では一致せず、`Not authorized to perform sts:AssumeRoleWithWebIdentity` になる。実際に送られている値はワークフロー内でトークンをデコードすれば確認できる。
 
+### 学習コンテナは root で実行する
+
+他のコンテナは非 root ユーザーで動かしているが、学習コンテナは root のままにしている。
+
+SageMaker は `/opt/ml/model` を root 所有で用意し、そこにコンテナが書き込む。非 root では権限エラーになり、Dockerfile 側で chown してもマウント時に上書きされる。
+
+学習ジョブは数分で終了するエフェメラルな実行で、ネットワークにも露出しない。常時リクエストを受ける推論エンドポイントとはリスクの質が違うので、そちらは非 root を維持する。
+
+### 学習ジョブは Terraform で管理しない
+
+SageMaker Training Job は一度実行して終了するリソースで、Terraform の宣言的管理と噛み合わない。`aws_sagemaker_*` にも Training Job に相当するリソースは無い。
+
+Terraform が持つのは ECR リポジトリと実行ロールまで。ジョブの起動は `boto3` のスクリプトで行う。
+
 ## 今後
 
 AWS
@@ -353,3 +367,19 @@ Docker Hub は匿名 pull に 401 を返すため `pull access denied ... may re
 
     image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     image: quay.io/minio/mc
+
+### 学習イメージは依存を分ける
+
+学習コンテナには `requirements.lock` をそのまま使わず、`requirements-train.lock` を別に用意している。
+
+ローカルの実行環境は MLflow クライアントと FastAPI を含むため、直接依存 9 個に対して lock は 294 行ある。学習に必要なのは `pandas` / `pyarrow` / `numpy` / `scikit-learn` の 4 つだけで、lock は 11 パッケージに収まる。
+
+|  | ローカル実行環境 | 学習コンテナ |
+| --- | --- | --- |
+| 直接依存 | 9 | 4 |
+| lock のパッケージ数 | 294 行 | 11 |
+| 転送サイズ | 334 MB | 193 MB |
+
+削減の狙いは保管費用ではない。ECR は $0.10/GB/月なので、140 MB 減らしても月 1 円台にしかならない。効くのは学習ジョブ起動時の pull 時間と CI のビルド時間で、ジョブが数分で終わる規模ではそこも支配的ではない。
+
+それでも分けたのは、`mlflow` を学習コンテナに入れると AWS 側で使わないライブラリを運ぶことになり、「AWS では MLflow を使わない」という判断とイメージの中身が食い違うため。`src/train.py` では `mlflow` の import を `run_local()` の内側に移してある。
