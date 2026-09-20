@@ -31,17 +31,10 @@ resource "aws_sagemaker_endpoint_configuration" "this" {
   name_prefix = "${var.project}-"
 
   production_variants {
-    variant_name = "default"
-    model_name   = aws_sagemaker_model.this.name
-
-    serverless_config {
-      # sklearn と pandas のインポートだけで 200MB 前後使う。
-      # 1024 だと起動失敗が原因の分かりにくい形で出る。
-      memory_size_in_mb = 2048
-
-      # 同時実行数。個人利用なので最小で足りる。
-      max_concurrency = 2
-    }
+    variant_name           = "default"
+    model_name             = aws_sagemaker_model.this.name
+    instance_type          = "ml.t2.medium"
+    initial_instance_count = 1
   }
 
   lifecycle {
