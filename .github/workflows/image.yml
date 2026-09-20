@@ -6,7 +6,10 @@ on:
     paths:
       - 'docker/train.Dockerfile'
       - 'docker/train-entrypoint.sh'
+      - 'docker/serve.Dockerfile'
+      - 'docker/serve-entrypoint.sh'
       - 'requirements-train.lock'
+      - 'requirements-serve.lock'
       - 'src/**'
       - '.github/workflows/image.yml'
   workflow_dispatch:
@@ -17,11 +20,13 @@ permissions:
 
 env:
   AWS_REGION: ap-northeast-1
-  ECR_REPO: 320813594497.dkr.ecr.ap-northeast-1.amazonaws.com/ops-side-of-ml/train
 
 jobs:
   push:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image: [train, serve]
     steps:
       - uses: actions/checkout@v5
 
@@ -33,10 +38,12 @@ jobs:
       - uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build and push
+        env:
+          REPO: 320813594497.dkr.ecr.ap-northeast-1.amazonaws.com/ops-side-of-ml/${{ matrix.image }}
         run: |
           # コミットハッシュでタグ付けし、どのコードから作られたか追えるようにする
-          docker build -f docker/train.Dockerfile \
-            -t "$ECR_REPO:${{ github.sha }}" \
-            -t "$ECR_REPO:latest" .
-          docker push "$ECR_REPO:${{ github.sha }}"
-          docker push "$ECR_REPO:latest"
+          docker build -f docker/${{ matrix.image }}.Dockerfile \
+            -t "$REPO:${{ github.sha }}" \
+            -t "$REPO:latest" .
+          docker push "$REPO:${{ github.sha }}"
+          docker push "$REPO:latest"
