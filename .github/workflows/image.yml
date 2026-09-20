@@ -1,0 +1,42 @@
+name: image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docker/train.Dockerfile'
+      - 'docker/train-entrypoint.sh'
+      - 'requirements-train.lock'
+      - 'src/**'
+      - '.github/workflows/image.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ap-northeast-1
+  ECR_REPO: 320813594497.dkr.ecr.ap-northeast-1.amazonaws.com/ops-side-of-ml/train
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::320813594497:role/ops-side-of-ml-gha-push
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push
+        run: |
+          # コミットハッシュでタグ付けし、どのコードから作られたか追えるようにする
+          docker build -f docker/train.Dockerfile \
+            -t "$ECR_REPO:${{ github.sha }}" \
+            -t "$ECR_REPO:latest" .
+          docker push "$ECR_REPO:${{ github.sha }}"
+          docker push "$ECR_REPO:latest"
