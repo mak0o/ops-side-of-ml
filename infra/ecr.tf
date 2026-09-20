@@ -1,18 +1,23 @@
-resource "aws_ecr_repository" "train" {
-  name = "${var.project}/train"
+locals {
+  ecr_repos = ["train", "serve"]
+}
 
-  # push のたびに脆弱性スキャンを走らせる
+resource "aws_ecr_repository" "this" {
+  for_each = toset(local.ecr_repos)
+
+  name = "${var.project}/${each.key}"
+
   image_scanning_configuration {
     scan_on_push = true
   }
 
-  # タグの上書きを許す。CI から latest を更新するため。
   image_tag_mutability = "MUTABLE"
 }
 
-# イメージは放置すると溜まり続けて課金対象になる
-resource "aws_ecr_lifecycle_policy" "train" {
-  repository = aws_ecr_repository.train.name
+resource "aws_ecr_lifecycle_policy" "this" {
+  for_each = aws_ecr_repository.this
+
+  repository = each.value.name
 
   policy = jsonencode({
     rules = [
@@ -41,6 +46,19 @@ resource "aws_ecr_lifecycle_policy" "train" {
   })
 }
 
-output "ecr_train_url" {
-  value = aws_ecr_repository.train.repository_url
+output "ecr_urls" {
+  value = { for k, v in aws_ecr_repository.this : k => v.repository_url }
+}
+
+# 単一リソースから for_each へ移行した。
+# これが無いと train リポジトリが destroy / create になり、push 済みの
+# イメージが失われる。移行が完了したら削除してよい。
+moved {
+  from = aws_ecr_repository.train
+  to   = aws_ecr_repository.this["train"]
+}
+
+moved {
+  from = aws_ecr_lifecycle_policy.train
+  to   = aws_ecr_lifecycle_policy.this["train"]
 }

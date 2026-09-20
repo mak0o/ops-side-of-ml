@@ -49,7 +49,7 @@ data "aws_iam_policy_document" "gha_push" {
       "ecr:BatchGetImage",
       "ecr:GetDownloadUrlForLayer",
     ]
-    resources = [aws_ecr_repository.train.arn]
+    resources = [for r in aws_ecr_repository.this : r.arn]
   }
 }
 
