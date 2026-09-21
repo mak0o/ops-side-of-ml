@@ -158,18 +158,25 @@ def _set_status(sm, arn: str, status: str, reason: str) -> None:
     )
 
 
-def promote_package(sm, arn: str, min_precision: float = MIN_PRECISION,
-                    min_recall: float = MIN_RECALL, dry_run: bool = False) -> bool:
-    """Model Package を判定し、Approved / Rejected を付ける。昇格したら True。"""
-    curr, curr_label, cand, cand_label = _load_sagemaker(sm, arn)
+def decide_package(sm, arn: str, curr: dict | None, curr_label: str | None,
+                   cand: dict, cand_label: str,
+                   min_precision: float = MIN_PRECISION, min_recall: float = MIN_RECALL,
+                   dry_run: bool = False, basis: str = "registered") -> bool:
+    """与えられた指標で判定し、Approved / Rejected を付ける。昇格したら True。
+
+    basis は比較に使った数値の出どころ。記録に残して、後から判定の根拠を区別できるようにする。
+      registered: 登録時の指標（各モデルが別々のデータで測った値）
+      holdout:    同じホールドアウトで測った値
+    """
     checks = judge(curr, curr_label, cand, cand_label, min_precision, min_recall)
+    source = f"promote.py ({basis})"
 
     if not all(ok for _, ok, _ in checks):
         print(f"REJECT: {cand_label} は昇格基準を満たしません")
         if not dry_run:
             # 判定結果をパッケージ側に残す。後から理由を追える。
             failed = ", ".join(f"{n} FAIL ({d})" for n, ok, d in checks if not ok)
-            _set_status(sm, arn, "Rejected", f"promote.py: {failed}")
+            _set_status(sm, arn, "Rejected", f"{source}: {failed}")
             print("status: Rejected")
         return False
 
@@ -178,9 +185,17 @@ def promote_package(sm, arn: str, min_precision: float = MIN_PRECISION,
         return True
 
     detail = "; ".join(f"{n} PASS ({d})" for n, _, d in checks)
-    _set_status(sm, arn, "Approved", f"promote.py: {detail}")
+    _set_status(sm, arn, "Approved", f"{source}: {detail}")
     print(f"PROMOTED: {cand_label} -> Approved")
     return True
+
+
+def promote_package(sm, arn: str, min_precision: float = MIN_PRECISION,
+                    min_recall: float = MIN_RECALL, dry_run: bool = False) -> bool:
+    """登録時の指標で判定する。ホールドアウトが無いときの手動判定用。"""
+    curr, curr_label, cand, cand_label = _load_sagemaker(sm, arn)
+    return decide_package(sm, arn, curr, curr_label, cand, cand_label,
+                          min_precision, min_recall, dry_run, basis="registered")
 
 
 # --- 共通 ---
