@@ -24,3 +24,12 @@ jobs:
           python-version: "3.12"
       - run: pip install -r requirements.lock -r requirements-dev.lock
       - run: python -m pytest -q
+
+  terraform-fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.14.0
+      - run: terraform fmt -check -recursive infra
