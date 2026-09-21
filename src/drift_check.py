@@ -18,6 +18,7 @@ import pandas as pd
 
 from src.baseline import interpret, psi
 from src.registry import REGION, container, latest_approved
+from src.results import write_json
 
 BUCKET = os.getenv("INFERENCE_LOG_BUCKET", "mlflow-bucket")
 PREFIX = os.getenv("INFERENCE_LOG_PREFIX", "inference-logs")
@@ -96,6 +97,9 @@ def main() -> None:
     parser.add_argument("--threshold", type=float, default=0.25)
     parser.add_argument("--min-samples", type=int, default=100,
                         help="これ未満は判定不能として終了コード 2 を返す")
+    parser.add_argument("--result-s3-uri", default=None,
+                        help="判定結果を JSON で書く。指定時はドリフトの有無にかかわらず"
+                             "終了コード 0 を返す（Processing Job 用）")
     args = parser.parse_args()
 
 
@@ -133,11 +137,13 @@ def main() -> None:
     print("-" * 66)
 
     drifted = []
+    scores = {}
     for col, stats in baseline["features"].items():
         if col not in logs.columns:
             continue
         values = logs[col].to_numpy(dtype=float)
         score = psi(stats, values)
+        scores[col] = round(float(score), 4)
         status = interpret(score)
         if score >= args.threshold:
             drifted.append(col)
@@ -149,8 +155,22 @@ def main() -> None:
     print()
     if drifted:
         print(f"DRIFT DETECTED: {', '.join(drifted)}")
+    else:
+        print("no significant drift")
+
+    if args.result_s3_uri:
+        write_json(args.result_s3_uri, {
+            "drift": bool(drifted),
+            "drifted_features": drifted,
+            "samples": len(logs),
+            "psi": scores,
+        })
+        print(f"result: {args.result_s3_uri}")
+        # ドリフトの有無は結果ファイルで返す。終了コードは「判定できたか」だけを表す。
+        return
+
+    if drifted:
         raise SystemExit(1)
-    print("no significant drift")
 
 if __name__ == "__main__":
     # 未捕捉の例外は終了コード 1 になり、「ドリフトあり」と区別できない。

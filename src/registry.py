@@ -32,3 +32,46 @@ def latest_approved(sm, group: str, exclude_arn: str | None = None) -> dict | No
 def container(desc: dict) -> dict:
     """パッケージの推論コンテナ定義（Image と ModelDataUrl）を返す。"""
     return desc["InferenceSpecification"]["Containers"][0]
+
+
+# 登録と昇格判定に必須の指標。欠けていたら登録しない。
+REQUIRED_METRICS = ["f2", "precision", "recall"]
+
+
+def register_training_job(sm, desc: dict, serve_image: str,
+                          group: str = MODEL_PACKAGE_GROUP) -> str:
+    """学習ジョブの成果物を Model Package として登録し、ARN を返す。
+
+    desc は describe_training_job の結果。状態は PendingManualApproval で、
+    昇格するかは promote が決める。
+    """
+    metrics = {m["MetricName"]: m["Value"] for m in desc.get("FinalMetricDataList", [])}
+
+    missing = [k for k in REQUIRED_METRICS if k not in metrics]
+    if missing:
+        print(f"ERROR: 指標が記録されていません: {', '.join(missing)}")
+        print("登録しません。MetricDefinitions と学習ログを確認してください。")
+        raise SystemExit(2)
+
+    job_name = desc["TrainingJobName"]
+    artifact = desc["ModelArtifacts"]["S3ModelArtifacts"]
+
+    resp = sm.create_model_package(
+        ModelPackageGroupName=group,
+        ModelPackageDescription=f"training job: {job_name}",
+        InferenceSpecification={
+            "Containers": [{"Image": serve_image, "ModelDataUrl": artifact}],
+            "SupportedContentTypes": ["application/json"],
+            "SupportedResponseMIMETypes": ["application/json"],
+        },
+        ModelApprovalStatus="PendingManualApproval",
+        # 値は文字列しか持てない。promote 側で float に戻す。
+        CustomerMetadataProperties={
+            **{k: f"{v:.4f}" for k, v in metrics.items()},
+            "training_job": job_name,
+        },
+    )
+
+    arn = resp["ModelPackageArn"]
+    print(f"registered: {arn} (PendingManualApproval)")
+    return arn
