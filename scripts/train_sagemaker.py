@@ -24,6 +24,10 @@ METRIC_DEFINITIONS = [
     for name in ["precision", "recall", "f1", "f2", "average_precision"]
 ]
 
+# ① 登録と昇格判定に必須の指標。欠けていたら登録しない。
+REQUIRED_METRICS = ["f2", "precision", "recall"]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=Path, default=Path("data/cost.parquet"))
@@ -33,7 +37,18 @@ def main() -> None:
     parser.add_argument("--instance-type", type=str, default="ml.m5.large")
     parser.add_argument("--image-tag", type=str, default="latest")
     parser.add_argument("--wait", action="store_true", help="完了まで待つ")
+    # ② 登録用の引数
+    parser.add_argument("--register", action="store_true",
+                        help="完了後に Model Package として登録する（--wait が必要）")
+    parser.add_argument("--serve-image-tag", type=str, default=None,
+                        help="登録するパッケージに紐づける推論イメージのタグ")
     args = parser.parse_args()
+
+    # ③-1 引数の組み合わせを先に検査する。学習を始めてから気づくと課金が無駄になる。
+    if args.register and not args.wait:
+        raise SystemExit("--register には --wait が必要です")
+    if args.register and not args.serve_image_tag:
+        raise SystemExit("--register には --serve-image-tag が必要です")
 
     sts = boto3.client("sts", region_name=REGION)
     account = sts.get_caller_identity()["Account"]
@@ -101,11 +116,22 @@ def main() -> None:
         f"#/jobs/{job_name}"
     )
 
-    if args.wait:
-        _wait(sm, job_name)
+    # ③-2 待たないならここで終わり
+    if not args.wait:
+        return
+
+    desc = _wait(sm, job_name)
+
+    # ③-3 完了したら登録する
+    if args.register and desc["TrainingJobStatus"] == "Completed":
+        serve_image = (
+            f"{account}.dkr.ecr.{REGION}.amazonaws.com/{PROJECT}/serve:{args.serve_image_tag}"
+        )
+        _register(sm, desc, serve_image)
 
 
-def _wait(sm, job_name: str) -> None:
+def _wait(sm, job_name: str) -> dict:
+    """完了まで待ち、最後の describe 結果を返す。"""
     while True:
         desc = sm.describe_training_job(TrainingJobName=job_name)
         status = desc["TrainingJobStatus"]
@@ -125,10 +151,49 @@ def _wait(sm, job_name: str) -> None:
             else:
                 print(desc.get("FailureReason", "(理由不明)"))
 
-            return
+            # ④ describe の結果を呼び出し元に返す（以前は return だけだった）
+            return desc
 
         print(f"{status} ...")
         time.sleep(20)
+
+
+# ⑤ ここに新しい関数を追加する。_wait() の後ろ、if __name__ の前。
+def _register(sm, desc: dict, serve_image: str) -> str:
+    """学習ジョブの成果物を Model Package として登録する。
+
+    状態は PendingManualApproval。昇格するかは promote.py が決める。
+    """
+    metrics = {m["MetricName"]: m["Value"] for m in desc.get("FinalMetricDataList", [])}
+
+    missing = [k for k in REQUIRED_METRICS if k not in metrics]
+    if missing:
+        print(f"ERROR: 指標が記録されていません: {', '.join(missing)}")
+        print("登録しません。MetricDefinitions と学習ログを確認してください。")
+        raise SystemExit(2)
+
+    job_name = desc["TrainingJobName"]
+    artifact = desc["ModelArtifacts"]["S3ModelArtifacts"]
+
+    resp = sm.create_model_package(
+        ModelPackageGroupName=MODEL_NAME,
+        ModelPackageDescription=f"training job: {job_name}",
+        InferenceSpecification={
+            "Containers": [{"Image": serve_image, "ModelDataUrl": artifact}],
+            "SupportedContentTypes": ["application/json"],
+            "SupportedResponseMIMETypes": ["application/json"],
+        },
+        ModelApprovalStatus="PendingManualApproval",
+        # 値は文字列しか持てない。promote.py 側で float に戻す。
+        CustomerMetadataProperties={
+            **{k: f"{v:.4f}" for k, v in metrics.items()},
+            "training_job": job_name,
+        },
+    )
+
+    arn = resp["ModelPackageArn"]
+    print(f"registered: {arn} (PendingManualApproval)")
+    return arn
 
 
 if __name__ == "__main__":

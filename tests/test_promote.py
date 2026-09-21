@@ -1,6 +1,6 @@
 """昇格判定ロジックのテスト。"""
 
-from src.promote import evaluate
+from src.promote import _metrics_from_package, evaluate
 
 GOOD = {"f2": 0.833, "precision": 0.778, "recall": 0.848}
 
@@ -41,3 +41,12 @@ def test_recall_floor_blocks_low_recall_model():
     checks = evaluate(GOOD, candidate, 0.6, 0.8)
     assert not passed(checks)
     assert dict((n, ok) for n, ok, _ in checks)["recall"] is False
+
+
+def test_package_metadata_is_converted_to_float():
+    """SageMaker のメタデータは文字列なので float に戻し、数値でない値は捨てる。"""
+    desc = {"CustomerMetadataProperties": {
+        "f2": "0.8150", "precision": "0.7255", "training_job": "job-123",
+    }}
+    metrics = _metrics_from_package(desc)
+    assert metrics == {"f2": 0.815, "precision": 0.7255}
