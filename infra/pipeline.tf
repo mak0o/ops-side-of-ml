@@ -494,7 +494,7 @@ resource "aws_sfn_state_machine" "pipeline" {
           AppSpecification = {
             ImageUri               = local.pipeline_serve_image
             ContainerEntrypoint    = ["python", "-m", "src.register_and_promote"]
-            "ContainerArguments.$" = "States.Array('--training-job', States.Format('tr-{}', $.run.name), '--serve-image', '${local.pipeline_serve_image}', '--result-s3-uri', States.Format('s3://${local.bucket}/{}', $.paths.promote_key))"
+            "ContainerArguments.$" = "States.Array('--training-job', States.Format('tr-{}', $.run.name), '--serve-image', '${local.pipeline_serve_image}', '--eval-s3-uri', $.eval_prefix, '--result-s3-uri', States.Format('s3://${local.bucket}/{}', $.paths.promote_key))"
           }
           ProcessingResources = local.processing_resources
           Environment = {
@@ -647,6 +647,7 @@ resource "aws_scheduler_schedule" "pipeline" {
     input = jsonencode({
       input_prefix          = "s3://${local.bucket}/batch-input/latest/"
       training_input_prefix = "s3://${local.bucket}/training-input/latest/"
+      eval_prefix           = "s3://${local.bucket}/eval-input/latest/"
     })
   }
 }
