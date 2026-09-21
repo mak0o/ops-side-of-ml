@@ -12,6 +12,8 @@ from pathlib import Path
 
 import boto3
 
+from src.registry import MODEL_PACKAGE_GROUP, register_training_job
+
 REGION = "ap-northeast-1"
 PROJECT = "ops-side-of-ml"
 MODEL_NAME = "cost-anomaly-detector"
@@ -23,9 +25,6 @@ METRIC_DEFINITIONS = [
     {"Name": name, "Regex": rf"^{name}=([0-9\.]+);"}
     for name in ["precision", "recall", "f1", "f2", "average_precision"]
 ]
-
-# ① 登録と昇格判定に必須の指標。欠けていたら登録しない。
-REQUIRED_METRICS = ["f2", "precision", "recall"]
 
 
 def main() -> None:
@@ -127,7 +126,7 @@ def main() -> None:
         serve_image = (
             f"{account}.dkr.ecr.{REGION}.amazonaws.com/{PROJECT}/serve:{args.serve_image_tag}"
         )
-        _register(sm, desc, serve_image)
+        register_training_job(sm, desc, serve_image, MODEL_PACKAGE_GROUP)
 
 
 def _wait(sm, job_name: str) -> dict:
@@ -156,44 +155,6 @@ def _wait(sm, job_name: str) -> dict:
 
         print(f"{status} ...")
         time.sleep(20)
-
-
-# ⑤ ここに新しい関数を追加する。_wait() の後ろ、if __name__ の前。
-def _register(sm, desc: dict, serve_image: str) -> str:
-    """学習ジョブの成果物を Model Package として登録する。
-
-    状態は PendingManualApproval。昇格するかは promote.py が決める。
-    """
-    metrics = {m["MetricName"]: m["Value"] for m in desc.get("FinalMetricDataList", [])}
-
-    missing = [k for k in REQUIRED_METRICS if k not in metrics]
-    if missing:
-        print(f"ERROR: 指標が記録されていません: {', '.join(missing)}")
-        print("登録しません。MetricDefinitions と学習ログを確認してください。")
-        raise SystemExit(2)
-
-    job_name = desc["TrainingJobName"]
-    artifact = desc["ModelArtifacts"]["S3ModelArtifacts"]
-
-    resp = sm.create_model_package(
-        ModelPackageGroupName=MODEL_NAME,
-        ModelPackageDescription=f"training job: {job_name}",
-        InferenceSpecification={
-            "Containers": [{"Image": serve_image, "ModelDataUrl": artifact}],
-            "SupportedContentTypes": ["application/json"],
-            "SupportedResponseMIMETypes": ["application/json"],
-        },
-        ModelApprovalStatus="PendingManualApproval",
-        # 値は文字列しか持てない。promote.py 側で float に戻す。
-        CustomerMetadataProperties={
-            **{k: f"{v:.4f}" for k, v in metrics.items()},
-            "training_job": job_name,
-        },
-    )
-
-    arn = resp["ModelPackageArn"]
-    print(f"registered: {arn} (PendingManualApproval)")
-    return arn
 
 
 if __name__ == "__main__":
