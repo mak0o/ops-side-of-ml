@@ -15,6 +15,8 @@ import boto3
 BUCKET = os.getenv("INFERENCE_LOG_BUCKET", "mlflow-bucket")
 PREFIX = os.getenv("INFERENCE_LOG_PREFIX", "inference-logs")
 FLUSH_SIZE = int(os.getenv("INFERENCE_LOG_FLUSH_SIZE", "10"))
+# Batch Transform は出力を SageMaker が S3 に書くので、自前のログは不要。
+ENABLED = os.getenv("INFERENCE_LOG_ENABLED", "1") == "1"
 
 
 class InferenceLogger:
@@ -28,6 +30,8 @@ class InferenceLogger:
 
     def log(self, features: dict, prediction: int, probability: float,
             model_version: str | None) -> None:
+        if not ENABLED:
+            return     
         record = {
             "timestamp": datetime.now(UTC).isoformat(),
             "model_version": model_version,

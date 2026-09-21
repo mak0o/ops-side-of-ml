@@ -85,7 +85,6 @@ class CostRecord(BaseModel):
     day_of_week: int = Field(ge=0, le=6)
     is_weekend: int = Field(ge=0, le=1)
 
-
 def _predict(record: CostRecord) -> dict:
     if model is None:
         raise HTTPException(503, f"model not loaded: {model_error}")
@@ -97,7 +96,13 @@ def _predict(record: CostRecord) -> dict:
 
     logger.log(features, prediction, probability, model_version)
 
-    return {"is_anomaly": prediction, "probability": probability}
+    # Batch Transform の出力にはメタ情報が残らないため、
+    # レスポンス自体にモデルのバージョンを含める。
+    return {
+        "is_anomaly": prediction,
+        "probability": probability,
+        "model_version": model_version,
+    }
 
 
 # --- ローカル用 ---
