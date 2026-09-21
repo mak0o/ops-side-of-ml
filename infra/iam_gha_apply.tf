@@ -59,6 +59,8 @@ data "aws_iam_policy_document" "gha_apply" {
       "cloudwatch:*",
       "events:*",
       "lambda:*",
+      "states:*",
+      "scheduler:*",
     ]
     resources = ["*"]
   }
