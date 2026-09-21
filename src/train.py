@@ -12,16 +12,10 @@ from pathlib import Path
 import joblib
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import (
-    average_precision_score,
-    f1_score,
-    fbeta_score,
-    precision_score,
-    recall_score,
-)
 from sklearn.model_selection import train_test_split
 
 from src.baseline import compute_baseline
+from src.metrics import compute_metrics
 
 FEATURES = [
     "cost",
@@ -120,13 +114,11 @@ def train(df: pd.DataFrame, args: argparse.Namespace):
     y_pred = clf.predict(X_test)
     y_proba = clf.predict_proba(X_test)[:, 1]
 
-    metrics = {
-        "precision": precision_score(y_test, y_pred, zero_division=0),
-        "recall": recall_score(y_test, y_pred, zero_division=0),
-        "f1": f1_score(y_test, y_pred, zero_division=0),
-        "f2": fbeta_score(y_test, y_pred, beta=2, zero_division=0),
-        "average_precision": average_precision_score(y_test, y_proba),
-    }
+    # ランダム分割なので、移動平均の特徴量を通じて隣接日の情報が漏れる。
+    # この値は楽観的で、昇格判定の比較には使わない（ホールドアウトで評価し直す）。
+    metrics = compute_metrics(y_test, y_pred, y_proba)
+
+
     baseline = compute_baseline(X_train, FEATURES)
 
     return clf, metrics, baseline, X_train

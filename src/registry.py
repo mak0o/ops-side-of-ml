@@ -1,12 +1,21 @@
-# src/registry.py
-"""SageMaker Model Registry の参照。
+"""SageMaker Model Registry の参照と登録。
 
 ローカルの MLflow alias (@production) に相当する「現行モデル」の解決をここにまとめる。
 現行 = グループ内で作成日時が最新の Approved パッケージ。
 """
 
+import io
+import json
+import tarfile
+from urllib.parse import urlparse
+
+import boto3
+
 REGION = "ap-northeast-1"
 MODEL_PACKAGE_GROUP = "cost-anomaly-detector"
+
+# 登録と昇格判定に必須の指標。欠けていたら登録しない。
+REQUIRED_METRICS = ["f2", "precision", "recall"]
 
 
 def latest_approved(sm, group: str, exclude_arn: str | None = None) -> dict | None:
@@ -34,8 +43,24 @@ def container(desc: dict) -> dict:
     return desc["InferenceSpecification"]["Containers"][0]
 
 
-# 登録と昇格判定に必須の指標。欠けていたら登録しない。
-REQUIRED_METRICS = ["f2", "precision", "recall"]
+def load_model(artifact_uri: str, s3=None):
+    """model.tar.gz から学習済みモデルと特徴量の順序を読む。
+
+    features.json は学習時に run_sagemaker() がモデルと同じ tar に入れている。
+    推論時の列順をこれで再現する。
+    """
+    # joblib は scikit-learn と一緒に入る。awscli イメージには無いので関数内で import する。
+    import joblib
+
+    s3 = s3 or boto3.client("s3")
+    parsed = urlparse(artifact_uri)
+    body = s3.get_object(Bucket=parsed.netloc, Key=parsed.path.lstrip("/"))["Body"].read()
+
+    with tarfile.open(fileobj=io.BytesIO(body), mode="r:gz") as tar:
+        features = json.load(tar.extractfile("features.json"))
+        model = joblib.load(tar.extractfile("model.joblib"))
+
+    return model, features
 
 
 def register_training_job(sm, desc: dict, serve_image: str,
