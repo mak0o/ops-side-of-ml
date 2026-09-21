@@ -3,8 +3,12 @@
 インフラエンジニアが MLOps を運用側から実装した練習リポジトリ。
 題材は **AWS コストの異常検知**。合成データを使い、学習からドリフト検知・再学習判定までのループをローカルで一周させている。
 
-同じ構成を AWS (SageMaker) に載せる作業を進めている。学習（Training Job）、推論（Batch Transform）、
-ドリフト検知が AWS 上のリソースだけで動くところまで到達し、ローカルと同じ検知結果が再現できている。
+同じループを AWS (SageMaker + Step Functions) に載せた。バッチ推論 → ドリフト検知 → 再学習 → 昇格判定が
+人手を介さずに一周し、ローカルと同じ検知結果が再現できている。
+
+ただし、昇格判定には**別々のデータで測った数値を比べている**という未解決の欠陥がある
+（[昇格判定は同じデータで比べていない](#昇格判定は同じデータで比べていない)）。
+「ループが正しく回る」ことは確認できているが、「昇格判定が正しい判断をしている」ことは確認できていない。
 
 うまくいかなかった部分もそのまま残している（[Serverless Inference でエンドポイントを作成できなかった](#serverless-inference-でエンドポイントを作成できなかった)）。
 
@@ -36,13 +40,14 @@
            │
            └──> Terraform ──> S3, IAM, ECR, SageMaker
 
-    train_sagemaker.py ──> SageMaker Training Job ──> model.tar.gz (S3)
-                                                        │  (model.joblib + baseline.json)
-                                                        ↓
-    batch_transform.py ──> SageMaker Batch Transform ──> 推論ログ (S3, 特徴量 + 予測)
-                                                        │
-                                                        ↓
-                                     drift_check ←── baseline.json (model.tar.gz から)
+    Step Functions（EventBridge Scheduler から日次。現在は無効）
+      │
+      ├─ ResolveModel ──────── Model Registry の最新 Approved を解決
+      ├─ Batch Transform ───── 推論ログ (S3, 特徴量 + 予測)
+      ├─ Processing Job ────── drift_check ── baseline.json (model.tar.gz から)
+      │      └─ ドリフトなし → 終了
+      ├─ Training Job ──────── model.tar.gz (S3)
+      └─ Processing Job ────── register_and_promote ── Approved / Rejected
 
 ## セットアップ
 
@@ -302,6 +307,153 @@ PSI は 10 ビンに分けて構成比を比べるので、50 件だと 1 ビン
 
 100 は「10 ビンで各ビンに 10 件程度」という目安で、厳密な根拠はない。`--min-samples` で変えられる。
 
+## AWS でモデルを登録・昇格する
+
+ローカルの MLflow Registered Model に相当するものとして、SageMaker Model Registry の
+Model Package Group `cost-anomaly-detector` を使う。
+
+| | ローカル（MLflow） | AWS（SageMaker） |
+|---|---|---|
+| 登録 | `train.py --register` | `train_sagemaker.py --register` |
+| メトリクス | run の metrics | Model Package の `CustomerMetadataProperties` |
+| 現行モデル | `@production` alias | 作成日時が最新の `Approved` |
+| 昇格 | alias を付け替え | status を `Approved` に |
+| 拒否 | 何もしない | status を `Rejected` にし、理由を記録 |
+
+判定ロジック（`evaluate()`）はレジストリに依存しない純粋関数にしてあったので、そのまま流用している。
+差し替えたのは「メトリクスの取得」と「昇格の書き込み」だけ。
+
+    docker compose --profile tools run --rm awscli python scripts/train_sagemaker.py \
+      --wait --register --serve-image-tag <commit sha>
+
+    docker compose --profile tools run --rm awscli python -m src.promote \
+      --model-package-arn arn:aws:sagemaker:...:model-package/cost-anomaly-detector/1
+
+`batch_transform.py` と `drift_check.py` は `--model-package-group` を渡すと、最新の Approved から
+モデル・推論イメージ・ベースラインを自分で解決する。パッケージがイメージと成果物をセットで持っているので、
+グループ名だけで全てが決まる。推論結果の `model_version` にも `cost-anomaly-detector/1` のように
+モデルの世代が残る。
+
+### 初回昇格は無条件ではない
+
+v1 を昇格させる前に、わざと弱いモデル（`n_estimators=1, max_depth=1`、つまり切り株）を v2 として判定した。
+
+    current: none (初回昇格)
+    candidate(v2): f2=0.688  precision=0.398  recall=0.841
+
+    baseline     現行モデルなし、初回昇格          PASS
+    precision    0.398 >= 0.60                  FAIL
+    recall       0.841 >= 0.80                  PASS
+
+    REJECT: v2 は昇格基準を満たしません
+
+比較対象が無い初回は F2 の比較が効かないので、下限チェックだけが防御になる。
+F2 と別に下限を設けた理由がここにある。
+
+v1 と v2 の recall は **0.8409 で完全に同じ**だった。切り株でも `class_weight="balanced"` のおかげで
+異常をほぼ同じだけ拾えるが、代わりに正常を大量に異常と誤判定して precision が崩壊している。
+「recall さえ上がれば F2 は改善しうる」という懸念の具体例になっている。
+
+### 判定の理由をパッケージに残す
+
+拒否したパッケージには理由が記録される。コードもログも見ずに、SageMaker の状態だけから追える。
+
+    $ aws sagemaker describe-model-package --model-package-name <arn> \
+        --query '[ModelApprovalStatus,ApprovalDescription]'
+    ["Rejected", "promote.py: precision FAIL (0.398 >= 0.60)"]
+
+最初は `precision: 0.398 >= 0.60` と判定条件だけを書いていたが、数式として偽の文字列が
+「条件を満たした」ようにも読めるので、`FAIL` / `PASS` を明示する形に変えた。
+監査記録は、後から読む人が文脈を持っていない前提で書く必要がある。
+
+## AWS でループを回す
+
+Step Functions で、バッチ推論から昇格判定までを 1 つのワークフローにした。
+
+    aws stepfunctions start-execution \
+      --state-machine-arn arn:aws:states:...:stateMachine:ops-side-of-ml-pipeline \
+      --input '{"input_prefix": "s3://.../batch-input/drifted/",
+                "training_input_prefix": "s3://.../training-input/drifted/"}'
+
+推論データと再学習データの場所は実行時の入力で受け取る。データを S3 に置く役はワークフローの外にある
+（本来は Cost and Usage Report のエクスポートが担う位置）。
+
+Batch Transform と Training Job は Step Functions の SageMaker 統合（`.sync`）で直接呼び、
+drift_check と登録・昇格判定は Processing Job で動かす。
+
+### 2 回の実行結果
+
+**通常データ（学習と同じ母集団からランダム 200 件）**
+
+    Prepare → BuildPaths → ResolveModel → HasApprovedModel → DescribeModel → CreateModel
+      → Transform → DeleteModel → DriftCheck → ReadDriftResult → IsDrift → NoDrift
+
+drift.json の PSI は手動で実行したときと小数点以下 4 桁まで一致した（cost 0.0381、cost_ma7 0.0266 …）。
+同じ 200 件、同じモデル、同じベースラインから同じ値が出ているので、パイプラインの各段で情報が落ちていない。
+
+**コスト水準 1.5 倍のデータ**
+
+    ... → IsDrift → Train → RegisterAndPromote → ReadPromoteResult → IsApproved → Rejected
+
+    current  (v1): f2=0.815  precision=0.726  recall=0.841
+    candidate(v4): f2=0.760  precision=0.963  recall=0.722
+
+    f2           0.815 -> 0.760 (-0.055)        FAIL
+    precision    0.963 >= 0.60                  PASS
+    recall       0.722 >= 0.80                  FAIL
+
+ドリフトを検知し、再学習し、登録し、判定して拒否した。v1 が現行のまま残っている。
+
+v4 は v2 と逆の崩れ方をしている。誤報はほぼ無いが、異常を 4 件に 1 件以上見逃す。
+ローカルで「直近のみで学習すると recall が落ちる」（precision 0.889 / recall 0.667）と観察した現象が、
+AWS 上の自動パイプラインでも再現した。
+
+所要時間は通常経路で約 8 分、再学習まで進むと約 10 分。大半はジョブごとのインスタンス起動。費用は 1 回あたり数円。
+
+## 昇格判定は同じデータで比べていない
+
+**この節がこのリポジトリで最も重要な未解決の欠陥。**
+
+v4 の判定で比べた 2 つの F2 は、別々のデータで測った値だった。
+
+- v1 の F2 は、元のデータを学習用とテスト用に分けたときの**元データのテスト部分**での成績
+- v4 の F2 は、ドリフト後のデータを分けたときの**ドリフト後データのテスト部分**での成績
+
+別々の試験問題で取った点数を並べて、高いほうを採用している。v4 の F2 が低いのは、
+v4 が本当に劣っているからかもしれないし、ドリフト後のデータのほうが単に難しいからかもしれない。
+この判定からは区別できない。
+
+これは AWS に移して生じた問題ではない。**ローカルの `promote.py` の設計から持ち込んでいた**。
+[再学習は必ずしも改善しない](#再学習は必ずしも改善しない) の表も同じ構造で、そこで比べていた数値も厳密には比較可能ではない。
+登録時に保存した指標で比べる方式は、再評価の手間を省いた近道だった。
+
+### 今回の拒否はたまたま正しい根拠で成立している
+
+v4 の拒否理由は 2 つあった。
+
+- F2 の比較（FAIL）— 別データでの比較なので根拠が弱い
+- recall の下限（FAIL）— v4 自身のテストデータで 0.722 < 0.80。比較ではなく絶対基準
+
+今回の判定は下限チェックだけで成立しており、結論は変わらない。下限を比較と独立に設けていたことが、
+意図しない形で効いた。ただし下限を満たす候補が来たら、F2 の比較だけで入れ替えの可否が決まる。
+
+### 現行モデルの劣化を検知できない
+
+より深刻なのはこちら。**v1 がドリフト後のデータでどれだけ機能しているかは、誰も測っていない。**
+
+パイプラインは「候補が基準を満たさないので現行を維持」と判断したが、その現行モデル自体が
+ドリフトで劣化している可能性がある。今の昇格ゲートは「悪いモデルを入れない」ことはできても、
+「今のモデルが悪くなっている」ことは検知できない。
+
+### 直すには
+
+両方のモデルを、同じ直近期間の評価用データ（ホールドアウト）で推論し、その F2 を比べる。
+現行モデルの劣化も、同じ評価で数値として見える。
+
+ただし直近データに**正解ラベルが必要**になる。合成データでは生成できるので実装はできるが、
+実運用では [推論ログからラベルを得る手段がない](#推論ログからラベルを得る手段がない) に直結する。
+ここがこのプロジェクトの本当の限界。
+
 ## Serverless Inference でエンドポイントを作成できなかった
 
 同じモデル、同じイメージ、同じ実行ロールで結果が分かれた。
@@ -383,12 +535,16 @@ Batch Transform もそのまま使う（詳細は AWS 側の設計判断を参�
 | `src/serve.py` | 推論 API。ローカルは MLflow の `@production`、SageMaker は `/opt/ml/model/model.joblib` からモデルを読む |
 | `src/inference_logger.py` | 推論ログを JSON Lines で S3 にバッファ書き込み |
 | `src/drift_check.py` | ベースラインと推論ログを比較して PSI を算出 |
-| `src/promote.py` | 候補モデルを現行と比較し、基準を満たせば alias を移動 |
+| `src/promote.py` | 候補モデルを現行と比較し、基準を満たせば昇格。MLflow の alias と SageMaker の approval status の両方に対応 |
+| `src/registry.py` | SageMaker Model Registry の参照と登録。「現行 = 最新の Approved」の定義をここに集めている |
+| `src/register_and_promote.py` | 学習ジョブの成果物を登録し、そのまま昇格判定する（Processing Job 用） |
+| `src/results.py` | 判定結果を S3 に JSON で書く（Processing Job 用） |
 | `src/replay.py` | データを推論 API に流し込む検証用スクリプト |
 | `scripts/retrain_pipeline.sh` | 上記を繋いだ再学習パイプライン |
 | `scripts/train_sagemaker.py` | SageMaker Training Job を起動する |
 | `scripts/batch_transform.py` | SageMaker Batch Transform を起動する。Model の作成と削除も行う |
-| `infra/` | Terraform。S3 / IAM / ECR / SageMaker |
+| `infra/` | Terraform。S3 / IAM / ECR / SageMaker Model Registry |
+| `infra/pipeline.tf` | Step Functions のステートマシン、そのロール、日次スケジュール（無効） |
 | `infra/bootstrap/` | state バケットを作る。ここだけローカル state |
 | `docker/` | 用途別の Dockerfile（ml-app / mlflow / train / serve / terraform / aws） |
 
@@ -397,7 +553,12 @@ Batch Transform もそのまま使う（詳細は AWS 側の設計判断を参�
     docker compose run --rm --no-deps ml-app sh -c \
       "pip install -q -r requirements-dev.lock && python -m ruff check . && python -m pytest -q"
 
-PSI 計算、昇格判定ロジック、推論ログの形式の正規化をカバーしている。CI でも lint とあわせて実行される。
+PSI 計算、昇格判定ロジック、推論ログの形式の正規化、Model Registry からの現行モデルの解決と登録をカバーしている。
+CI でも lint とあわせて実行される。
+
+Model Registry のテストでは SageMaker の偽物を使い、`list_model_packages` に渡す並び順の引数
+（`SortBy="CreationTime"`, `SortOrder="Descending"`）を偽物の側で検査している。
+「最新の Approved が現行」という定義はこの引数に依存しているので、誰かが変えたらテストで気づける。
 
 ## 設計判断
 
@@ -461,7 +622,8 @@ PSI は件数が多いときにこの過敏さが出にくく、0.1 / 0.25 と�
 推論側は `models:/cost-anomaly-detector@production` という固定 URI を参照する。
 新しいバージョンを登録しても、alias を付け替えるまで推論側は既存のモデルを使い続ける。昇格もロールバックも alias の操作だけで済み、コードもデプロイ設定も変更しない。
 
-SageMaker Model Registry の approval status が同じ役割を果たすので、この構造のまま移行できる。
+SageMaker では Model Registry の approval status が同じ役割を果たす。
+実際にこの構造のまま移行でき、判定ロジックは一行も変えずに済んだ。
 
 ### 費用を抑える設計
 
@@ -476,7 +638,11 @@ SageMaker Model Registry の approval status が同じ役割を果たすので�
 コンテナから torch を外したことでイメージサイズは大幅に縮小し、ビルド時間は 137 秒から 26 秒になった。
 
 実測では、学習 1 回あたり 0.2 円（54 秒 × $0.13/時）。バッチ推論は課金秒数が 1 秒未満。
+パイプラインを 1 回回すと、再学習まで進んでも数円。
 アイドル時に課金されるリソースは無く、現在の月額は S3 と ECR で 10 円程度。
+
+日次スケジュールを有効にすると、ドリフトが無い日でも Transform と Processing Job で 1 日数円、
+月 100 円前後になる。スケジュールは Terraform で作ってあるが、昇格判定の欠陥が直るまで無効にしている。
 
 ## AWS 側の設計判断
 
@@ -693,6 +859,97 @@ AWS で自動化すると、これは無駄な Training Job の課金になる�
 終了コードで分岐する設計は一般的だが、言語ランタイムが既定で返すコードと意味が衝突していないかは
 確認しておく必要がある。
 
+### 現行モデルは「作成日時が最新の Approved」
+
+MLflow の alias は 1 つのバージョンを指すが、SageMaker の approval status はパッケージごとの属性で、
+複数の Approved が並びうる。そこで「作成日時が最新の Approved」を現行と定義した。
+
+副次的に、ロールバックが「最新の Approved を Rejected にする」だけで済む。1 つ前の Approved が自動的に現行に戻る。
+
+注意点として、作成日時で並べるので、古いパッケージを後から Approved にしても現行にはならない。
+自動化したフローでは登録直後に判定するので順序は崩れないが、手で操作するときは意識が要る。
+
+この定義は `src/registry.py` の `latest_approved()` とステートマシンの `ResolveModel` の 2 か所にある。
+Step Functions の定義は Python から参照できないので、二重管理になっている。
+
+### 「現行モデルなし」を例外で判定しない
+
+`promote.py` の MLflow 版は、現行モデルの取得を `except Exception` で囲み、
+**全ての例外を「現行モデルなし」と解釈していた**。
+
+MLflow サーバーへの接続失敗や認証エラーでも「初回昇格」扱いになり、現行と比較せずに下限チェックだけで
+昇格する。drift_check のクラッシュが再学習を引き起こしていたのと同じ種類の問題で、
+こちらは比較をすり抜けて本番モデルが入れ替わるので影響が大きい。
+
+alias の有無を `get_registered_model(...).aliases` で明示的に確認し、それ以外の失敗は例外のまま止めるように直した。
+
+### Processing Job では判定結果を終了コードで返さない
+
+drift_check と promote は、ローカルでは終了コードで結果を返す（0: ドリフトなし / 1: ドリフトあり / 2: 判定不能）。
+ところが Processing Job は 0 以外を全て**ジョブ失敗**として扱う。Step Functions から見ると
+「ドリフトを検知した」と「クラッシュした」が同じ Failed になり、区別するには FailureReason の文字列を解析するしかない。
+
+drift_check で直した「クラッシュとドリフトありが区別できない」問題が、別の層で再発する形だった。
+
+`--result-s3-uri` を指定すると、判定結果を JSON で S3 に書き、判定できた場合は結果にかかわらず終了コード 0 を返す。
+終了コードは「判定できたか」だけを表し、中身は JSON で受け渡す。
+昇格拒否（Rejected）も正常な判定結果なので、ジョブは成功で終わる。
+
+    {"drift": true, "drifted_features": ["cost", "cost_ma7", "cost_std7"], "samples": 200, "psi": {...}}
+    {"model_package_arn": "...:model-package/cost-anomaly-detector/4", "approved": false}
+
+### Processing Job は推論イメージで動かす
+
+当初は学習イメージを流用するつもりだったが、学習イメージの依存は `pandas / pyarrow / numpy / scikit-learn`
+の 4 つだけで、**boto3 が入っていない**。drift_check と promote は boto3 で S3 と SageMaker を叩くので動かない。
+
+推論イメージには boto3 と `src/` 一式が入っているので、そちらを使っている。
+FastAPI と uvicorn が余分に載るが数 MB。用途別に依存を分ける原則からは専用イメージを作るのが筋だが、
+ECR リポジトリと lock と CI が 1 つずつ増えるので、今は流用にとどめている。
+
+推論イメージは非 root で動くが、結果を S3 API で直接書き、ファイルシステムに書き込まないので問題にならなかった。
+
+### Step Functions の SageMaker 統合は AddTags を要求する
+
+最初の実行は Transform の起動で即座に失敗した。
+
+    not authorized to perform: sagemaker:AddTags on resource: ...transform-job/bt-...
+
+Step Functions の `.sync` 統合は、起動したジョブに管理用のタグを自動で付ける。
+パラメータに `Tags` を書いていなくても付与されるので、`sagemaker:AddTags` が要る。
+ロールを設計するとき「Tags を渡していないので不要」と判断して外していた。
+`createModel` の統合はタグを付けないので、Model の作成までは通っていた。
+
+### Fail State で本当の原因を隠していた
+
+上の AddTags の失敗は、最初 `describe-execution` では次のようにしか見えなかった。
+
+    ["TransformFailed", "Batch Transform が失敗しました。Model は削除を試みています"]
+
+Fail State に固定の文言を書いていたためで、本当の原因は実行履歴の `TaskFailed` イベントを掘らないと見えなかった。
+Catch で `$.error` に保存していたのに、Fail State がそれを使っていなかった。
+
+`ErrorPath` / `CausePath` で保存したエラーをそのまま出すように変えた。
+どの段階で失敗したかは State 名で分かり、なぜ失敗したかは `cause` で分かる。
+
+Serverless Inference の切り分けで「失敗したときに情報が出る作りになっているかで調査時間が桁で変わる」と
+書いたのと同じことを、自分の設計でやっていた。
+
+### Transform が失敗しても Model を消す
+
+ステートマシンは Transform の前に SageMaker Model を作り、後で消す。
+Transform が失敗したときも Catch から削除の State を通してから Fail で終わる。
+
+AddTags の失敗はちょうどこの経路を通った。実行後に `list-models` が空だったので、
+失敗経路での後片付けが実際に機能したことを確認できた。意図的に作りにくい経路なので、偶然とはいえ良い検証になった。
+
+### 権限の追加とリソースの作成を別の PR にする
+
+apply ロールに `states:*` と `scheduler:*` を足す変更と、ステートマシンを作る変更は PR を分けた。
+
+同じ PR にすると、Terraform は依存関係の無い両者を並列に作ろうとし、権限が反映される前に
+ステートマシンの作成が走って失敗する。CI で apply するロールの権限を広げるときは、先にそれだけを適用する。
+
 ## セキュリティ
 
 - 認証情報は `.env` に外出し（`.env.example` を参照）
@@ -709,11 +966,12 @@ AWS で自動化すると、これは無駄な Training Job の課金になる�
 |---|---|---|
 | MinIO | S3 | 完了 |
 | MLflow server | 使わない（ローカル専用） | 方針確定 |
-| Model Registry alias | SageMaker Model Registry approval status | 未着手 |
+| Model Registry alias | SageMaker Model Registry approval status | 完了 |
 | `train.py` | SageMaker Training Job | 完了 |
 | FastAPI (Docker) | SageMaker Batch Transform | 完了（Serverless Inference は**失敗**して保留） |
-| `drift_check.py` | 同じコードを AWS 上のデータに対して実行 | 手動で完了。Lambda 化は未着手 |
-| `retrain_pipeline.sh` | Step Functions + EventBridge | 未着手 |
+| `drift_check.py` | Processing Job | 完了 |
+| `promote.py` | Processing Job（登録と一体） | 完了 |
+| `retrain_pipeline.sh` | Step Functions + EventBridge Scheduler | 完了（スケジュールは無効） |
 
 ## 今後
 
@@ -725,8 +983,11 @@ AWS
 - [x] エンドポイントを立てて推論ログを S3 に溜める（Real-time で確認）
 - [x] Batch Transform でバッチ推論し、特徴量込みの推論ログを S3 に出す
 - [x] drift_check を AWS 上のデータとベースラインだけで動かす
-- [ ] Model Registry の approval status で昇格を管理する
-- [ ] Batch Transform → drift_check → 再学習 → 昇格判定 を Step Functions で自動化
+- [x] Model Registry の approval status で昇格を管理する
+- [x] Batch Transform → drift_check → 再学習 → 昇格判定 を Step Functions で自動化
+- [ ] 昇格判定を同じホールドアウトでの比較にする（現行モデルの劣化も測る）
+- [ ] 日次スケジュールを有効化する（上が済んでから）
+- [ ] Processing Job 用の専用イメージを作る
 - [ ] Serverless Inference での作成失敗を解決する（保留）
 
 その他
@@ -735,6 +996,11 @@ AWS
 - [ ] 学習ウィンドウの自動決定
 
 ## 未解決の課題
+
+### 昇格判定が別々のデータで測った数値を比べている
+
+詳細は [昇格判定は同じデータで比べていない](#昇格判定は同じデータで比べていない)。
+現行モデルがドリフトで劣化していても検知できない点も含め、最優先で直すべき課題。
 
 ### 推論ログからラベルを得る手段がない
 
@@ -757,11 +1023,13 @@ AWS に移してもこの問題は解決しない。移行で証明できるの�
 
 `--since` で学習期間を手動指定しているが、実運用では「直近 N 日」のようなルールか、ドリフト検知時点からの自動判定が必要になる。
 
-### 学習データとモデルバージョンの対応
+### 学習データとモデルバージョンの対応（解決済み）
 
-現在 `MODEL_VERSION` には推論イメージのコミットハッシュを入れている。
-本来はモデルの世代を示すべきで、イメージのバージョンとは別物。
-Model Registry を導入したら Model Package のバージョン番号に置き換える。
+以前は `MODEL_VERSION` に推論イメージのコミットハッシュを入れていた。
+Model Registry の導入後は、推論結果に `cost-anomaly-detector/1` のように Model Package のバージョンが入る。
+
+ただし「そのモデルをどのデータで学習したか」は、Model Package のメタデータの `training_job` から
+学習ジョブを辿り、その入力の S3 パスを見る必要がある。直接は記録していない。
 
 ### 学習成果物のライフサイクル
 
