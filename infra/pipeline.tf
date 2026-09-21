@@ -119,6 +119,8 @@ data "aws_iam_policy_document" "sfn" {
       "sagemaker:StopProcessingJob",
       "sagemaker:CreateModel",
       "sagemaker:DeleteModel",
+      # .sync 統合はジョブに管理用のタグを自動で付けるので必要
+      "sagemaker:AddTags",
     ]
     resources = [
       "arn:aws:sagemaker:${var.region}:${local.account_id}:transform-job/bt-*",
@@ -556,28 +558,30 @@ resource "aws_sfn_state_machine" "pipeline" {
         Cause = "Model Package Group に Approved のモデルがありません"
       }
 
+      # Catch で $.error に保存した実際のエラーをそのまま出す。
+      # 固定の文言にすると、原因を知るのに実行履歴を掘る必要がある。
       TransformFailed = {
-        Type  = "Fail"
-        Error = "TransformFailed"
-        Cause = "Batch Transform が失敗しました。Model は削除を試みています"
+        Type      = "Fail"
+        ErrorPath = "$.error.Error"
+        CausePath = "$.error.Cause"
       }
 
       DriftCheckFailed = {
-        Type  = "Fail"
-        Error = "DriftCheckFailed"
-        Cause = "ドリフトを判定できませんでした（ログ不足、件数不足、クラッシュ）。/aws/sagemaker/ProcessingJobs を確認してください"
+        Type      = "Fail"
+        ErrorPath = "$.error.Error"
+        CausePath = "$.error.Cause"
       }
 
       TrainFailed = {
-        Type  = "Fail"
-        Error = "TrainFailed"
-        Cause = "再学習が失敗しました"
+        Type      = "Fail"
+        ErrorPath = "$.error.Error"
+        CausePath = "$.error.Cause"
       }
 
       PromoteFailed = {
-        Type  = "Fail"
-        Error = "PromoteFailed"
-        Cause = "登録または昇格判定ができませんでした。/aws/sagemaker/ProcessingJobs を確認してください"
+        Type      = "Fail"
+        ErrorPath = "$.error.Error"
+        CausePath = "$.error.Cause"
       }
     }
   })
