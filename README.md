@@ -3,7 +3,9 @@
 インフラエンジニアが MLOps を運用側から実装した練習リポジトリ。
 題材は **AWS コストの異常検知**。合成データを使い、学習からドリフト検知・再学習判定までのループをローカルで一周させている。
 
-同じ構成を AWS (SageMaker) に載せる作業を進めており、学習と推論は AWS 上で動くところまで到達した。
+同じ構成を AWS (SageMaker) に載せる作業を進めている。学習（Training Job）、推論（Batch Transform）、
+ドリフト検知が AWS 上のリソースだけで動くところまで到達し、ローカルと同じ検知結果が再現できている。
+
 うまくいかなかった部分もそのまま残している（[Serverless Inference でエンドポイントを作成できなかった](#serverless-inference-でエンドポイントを作成できなかった)）。
 
 ## 構成
@@ -35,9 +37,12 @@
            └──> Terraform ──> S3, IAM, ECR, SageMaker
 
     train_sagemaker.py ──> SageMaker Training Job ──> model.tar.gz (S3)
-                                                          │
-                                                          ↓
-                                              SageMaker Endpoint ──> 推論ログ (S3)
+                                                        │  (model.joblib + baseline.json)
+                                                        ↓
+    batch_transform.py ──> SageMaker Batch Transform ──> 推論ログ (S3, 特徴量 + 予測)
+                                                        │
+                                                        ↓
+                                     drift_check ←── baseline.json (model.tar.gz から)
 
 ## セットアップ
 
@@ -194,46 +199,108 @@ f1 と f2 が正しく出ていたため気づきにくかった。ローカル�
 54 秒のうち実際の学習は数秒で、大半はインスタンスの起動とイメージの pull が占める。
 学習そのものを速くしても課金は大きく減らない。効くのはイメージサイズとインスタンスタイプの選択。
 
-## AWS で推論する
+## AWS でバッチ推論する
 
-Terraform で SageMaker Model / Endpoint Configuration / Endpoint を作る。
+SageMaker Batch Transform で、S3 のデータをまとめて推論する。
 
-    docker compose --profile tools run --rm terraform \
-      terraform apply -var-file=terraform.ci.tfvars
+    docker compose --profile tools run --rm awscli python scripts/batch_transform.py \
+      --data data/cost.parquet \
+      --model-artifact s3://.../training-output/<job>/output/model.tar.gz \
+      --image-tag <commit sha> \
+      --limit 200 --sample --join-input --wait
 
-デプロイするモデルとイメージは `infra/terraform.ci.tfvars` で明示する。
+スクリプトは次の順で動く。
 
-    model_artifact_uri = "s3://.../training-output/<job>/output/model.tar.gz"
-    serve_image_tag    = "<commit sha>"
+1. parquet を JSON Lines に変換して S3 に置く
+2. SageMaker Model を作る（推論イメージ + `model.tar.gz`）
+3. Transform Job を実行して完了を待つ
+4. Model を削除する
 
-推論の実行。
+出力は推論ログと同じ日付パーティションに書く。
 
-    docker compose --profile tools run --rm awscli python -c "
-    import boto3, json
-    rt = boto3.client('sagemaker-runtime', region_name='ap-northeast-1')
-    r = rt.invoke_endpoint(
-        EndpointName='ops-side-of-ml-endpoint',
-        ContentType='application/json',
-        Body=json.dumps({
-            'cost': 120.5, 'cost_ma7': 78.2, 'cost_std7': 26.4,
-            'cost_ratio_ma7': 1.54, 'cost_vs_lastweek': 1.48,
-            'day_of_week': 3, 'is_weekend': 0
-        }),
-    )
-    print(r['Body'].read().decode())
-    "
+    s3://<bucket>/inference-logs/year=2026/month=09/day=21/<job>/input.jsonl.out
 
-    {"is_anomaly":1,"probability":0.890993501731741}
+1 行に特徴量と予測結果が並ぶ。予測は `SageMakerOutput` の下に入る。
 
-ローカルと同じ値が返る。推論ログも設計どおりのパーティションで S3 に書かれる。
+    {"SageMakerOutput":{"is_anomaly":0,"model_version":"1835041f...","probability":0.0347},
+     "cost":28.6,"cost_ma7":26.56,"cost_ratio_ma7":1.08,"cost_std7":1.80,
+     "cost_vs_lastweek":0.98,"day_of_week":2,"is_weekend":0}
 
-    flushed 1 records -> s3://ops-side-of-ml-<account>/inference-logs/year=2026/month=09/day=20/130052-955e6430.jsonl
+`ml.m5.large` で 1 回あたり数分、課金秒数は 1 秒未満（`BillableTimeInSeconds: 0`）。
+待ち時間の大半はインスタンスの起動。
 
-このパスは `drift_check.py` がそのまま読める形になっている。
+## AWS でドリフト検知する
 
-**現在このエンドポイントは destroy してある。** Serverless Inference での作成に失敗し、
-切り分けのために立てた Real-time エンドポイント（$0.065/時）を残すと費用方針に反するため。
-経緯は次節。
+`model.tar.gz` に同梱した `baseline.json` と、S3 の推論ログを比較する。MLflow にも MinIO にも依存しない。
+
+    docker compose --profile tools run --rm awscli sh -c \
+      "INFERENCE_LOG_BUCKET=ops-side-of-ml-<account> python -m src.drift_check \
+        --model-artifact s3://.../training-output/<job>/output/model.tar.gz \
+        --prefix inference-logs/year=2026/month=09/day=21/<job>/"
+
+`--model-artifact` を渡すと S3 の tar から、渡さなければ従来どおり MLflow からベースラインを読む。
+
+### ローカルと同じ結果が再現できるか
+
+Batch Transform にランダム抽出した 200 件を流して確かめた。
+
+**通常データ（学習と同じ母集団）**
+
+    feature                   PSI  status        base_mean  curr_mean
+    ------------------------------------------------------------------
+    cost                   0.0381  stable            86.96      82.76
+    cost_ma7               0.0266  stable            86.32      82.51
+    cost_std7              0.0392  stable            27.19      27.18
+    cost_ratio_ma7         0.0166  stable             1.01       1.02
+    cost_vs_lastweek       0.0518  stable             1.11       1.06
+
+    no significant drift
+
+**コスト水準 1.5 倍のデータ（`--drift 1.5`）**
+
+    feature                   PSI  status        base_mean  curr_mean
+    ------------------------------------------------------------------
+    cost                   0.9864  significant       86.96     114.74
+    cost_ma7               4.2987  significant       86.32     114.55
+    cost_std7              0.5120  significant       27.19      31.36
+    cost_ratio_ma7         0.0848  stable             1.01       1.00
+    cost_vs_lastweek       0.0625  stable             1.11       1.05
+
+    DRIFT DETECTED: cost, cost_ma7, cost_std7
+
+絶対値の特徴量が反応し、比率の特徴量は stable のまま。ローカルで確認した
+「利用規模が拡大しただけで、異常の出方そのものは変わっていない」という読み方が AWS 上でも成立する。
+
+PSI の値そのものはローカルの結果と一致しない。ベースラインが別のモデル（学習データの範囲が違う）で、
+抽出方法も違う（ローカルは先頭 400 件、こちらはランダム 200 件）ため。見るべきは傾向。
+
+`cost_ma7` の PSI が突出しているのは、7 日移動平均が平滑化されていて分布の幅が狭いから。
+同じ水準のずれでも、幅の狭い分布では大半の値がベースラインのビンの外に出る。
+
+### 最初の検証は間違った結論を出していた
+
+最初はデータの先頭 50 件（`head(50)`）で試し、次の結果になった。
+
+    cost                   7.1212  significant       86.96      31.01
+    cost_ratio_ma7         1.4426  significant        1.01       1.02
+    cost_vs_lastweek       0.3468  significant        1.11       1.10
+
+    DRIFT DETECTED: cost, cost_ma7, cost_std7, cost_ratio_ma7, cost_vs_lastweek
+
+原因は 2 つ重なっていた。
+
+- 先頭 50 件は合成データの初期で、利用規模が小さい期間に偏っている（`cost` の平均が 31）
+- 件数が少なすぎて PSI が不安定になっている
+
+後者は、比率の特徴量が **平均はほぼ同じ（1.01 と 1.02）なのに significant** になっていることで分かる。
+PSI は 10 ビンに分けて構成比を比べるので、50 件だと 1 ビンあたり 5 件程度しかない。
+空のビンや 1 件だけのビンができると値が跳ねる。ランダム 200 件にすると同じ特徴量が 0.017 に落ちた。
+
+そのため `drift_check` に件数の下限を設け、下回ったら判定不能（終了コード 2）で止めるようにした。
+
+    samples 50 < 100: 判定に必要な件数に達していません
+
+100 は「10 ビンで各ビンに 10 件程度」という目安で、厳密な根拠はない。`--min-samples` で変えられる。
 
 ## Serverless Inference でエンドポイントを作成できなかった
 
@@ -295,6 +362,17 @@ SageMaker では `/ping` が 503 を返し続け、「エンドポイント作�
 同じ理由で、Real-time を一度挟んだのは正解だった。Serverless はログが出ない構成なので、
 ログが出る構成で先に「コンテナとイメージは正常」を確定させないと、仮説を潰す先が絞れない。
 
+### その後の判断
+
+Serverless の解決は保留し、推論は Batch Transform に切り替えた。
+
+題材は日次のコストデータで、リアルタイム性の要求がない。常時アクセスできる推論 API は
+ローカルで FastAPI を使った延長で選んでいただけで、ユースケースからは導かれていなかった。
+Batch Transform なら実行時だけ課金され、Serverless の問題も迂回できる。
+
+推論イメージは作り直していない。エンドポイント用に作った `/ping` と `/invocations` を
+Batch Transform もそのまま使う（詳細は AWS 側の設計判断を参照）。
+
 ## ファイル
 
 | ファイル | 役割 |
@@ -309,6 +387,7 @@ SageMaker では `/ping` が 503 を返し続け、「エンドポイント作�
 | `src/replay.py` | データを推論 API に流し込む検証用スクリプト |
 | `scripts/retrain_pipeline.sh` | 上記を繋いだ再学習パイプライン |
 | `scripts/train_sagemaker.py` | SageMaker Training Job を起動する |
+| `scripts/batch_transform.py` | SageMaker Batch Transform を起動する。Model の作成と削除も行う |
 | `infra/` | Terraform。S3 / IAM / ECR / SageMaker |
 | `infra/bootstrap/` | state バケットを作る。ここだけローカル state |
 | `docker/` | 用途別の Dockerfile（ml-app / mlflow / train / serve / terraform / aws） |
@@ -318,7 +397,7 @@ SageMaker では `/ping` が 503 を返し続け、「エンドポイント作�
     docker compose run --rm --no-deps ml-app sh -c \
       "pip install -q -r requirements-dev.lock && python -m ruff check . && python -m pytest -q"
 
-PSI 計算と昇格判定ロジックをカバーしている。CI でも lint とあわせて実行される。
+PSI 計算、昇格判定ロジック、推論ログの形式の正規化をカバーしている。CI でも lint とあわせて実行される。
 
 ## 設計判断
 
@@ -347,7 +426,11 @@ AWS では MLflow の run が無いので、代わりに `model.tar.gz` の中�
 ### KS 検定ではなく PSI
 
 KS 検定はサンプル数が増えると些細な差でも有意になる。本番では数万件のログが溜まるので、実質的に常に「ドリフトあり」と報告されてしまう。
-PSI はサンプル数に依存しにくく、0.1 / 0.25 という実務的な閾値が確立している。
+PSI は件数が多いときにこの過敏さが出にくく、0.1 / 0.25 という実務的な閾値が確立している。
+
+ただし逆に、**件数が少ないと PSI は不安定になる**。同じ母集団から取った 50 件で significant が出た
+（[最初の検証は間違った結論を出していた](#最初の検証は間違った結論を出していた)）。
+そのため `drift_check` は件数が下限を下回ると判定不能として止まる。
 
 ### 自動昇格の判定基準
 
@@ -392,7 +475,7 @@ SageMaker Model Registry の approval status が同じ役割を果たすので�
 
 コンテナから torch を外したことでイメージサイズは大幅に縮小し、ビルド時間は 137 秒から 26 秒になった。
 
-実測では、学習 1 回あたり 0.2 円（54 秒 × $0.13/時）。
+実測では、学習 1 回あたり 0.2 円（54 秒 × $0.13/時）。バッチ推論は課金秒数が 1 秒未満。
 アイドル時に課金されるリソースは無く、現在の月額は S3 と ECR で 10 円程度。
 
 ## AWS 側の設計判断
@@ -413,11 +496,17 @@ Serverless Inference は、GPU、VPC 構成、マルチモデルエンドポイ�
 
 ### 推論ログはバッファせず毎回書く
 
-ローカルでは 10 件ずつバッファして S3 に書いているが、SageMaker では `INFERENCE_LOG_FLUSH_SIZE=1` を渡して毎回書かせる。
+ローカルでは 10 件ずつバッファして S3 に書いているが、エンドポイントでは `INFERENCE_LOG_FLUSH_SIZE=1` を渡して毎回書かせる。
 
-Serverless Inference はリクエストが無いとコンテナごと停止する。
-停止時に `shutdown` が発火する保証がないので、バッファに残ったログは失われる。
+SageMaker のコンテナは停止時に `shutdown` が発火する保証がなく、バッファに残ったログは失われる。
 ドリフト検知が推論ログに依存している以上、欠損は許容できない。
+
+これは推測ではなく観測している。Batch Transform で `FLUSH_SIZE=1000000` を渡してバッファさせたところ、
+ジョブは正常に完了したのにログは 1 件も書かれなかった。FastAPI の `lifespan` の終了処理
+（`logger.flush()`）が呼ばれないまま、コンテナが止まっている。
+
+なお Batch Transform では出力を SageMaker が S3 に書くので、自前のログ書き出しは
+`INFERENCE_LOG_ENABLED=0` で止めている。
 
 これは「推論ログを MLflow に書かない」理由として挙げた同期 I/O の問題を、自ら受け入れることになる。
 ただし根拠は違う。
@@ -530,6 +619,80 @@ Terraform はタグ文字列しか見ないので差分が出ず、古いイメ�
 そのため「イメージを push する PR」と「タグを更新する PR」の 2 段階になる。
 手数は増えるが、どのコミットのイメージが動いているかが state から追える。
 
+### Batch Transform で既存の推論イメージをそのまま使う
+
+Batch Transform もエンドポイントと同じく `/ping` と `/invocations` を叩く。
+エンドポイント用に作った推論イメージが、コード変更なしで動いた。
+
+条件は Content-Type の指定。SageMaker で JSON Lines を扱う標準は `application/jsonlines` だが、
+FastAPI は pydantic のモデルを受ける関数に `application/json` 以外が来ると 422 を返す。
+
+    "ContentType": "application/json",
+    "SplitType": "Line",
+    "BatchStrategy": "SingleRecord",
+
+`SplitType: Line` で入力ファイルを 1 行ずつ切り出し、各行を `application/json` として送る。
+1 行 1 リクエストになるので大量データには向かないが、日次のコストデータなら十分。
+
+### JoinSource で出力に特徴量を残す
+
+Batch Transform の出力は、既定では予測結果だけになる。`drift_check` は特徴量の分布を比べるので、
+予測だけでは使えない。
+
+`DataProcessing.JoinSource: "Input"` を指定すると、入力の各行に予測結果が `SageMakerOutput` として結合される。
+入力と出力を自前で突き合わせる層が要らなくなる。
+
+出力にはどのモデルで推論したかが残らないので、推論 API のレスポンス自体に `model_version` を含めた。
+`SageMakerOutput` の中に入る。
+
+### 推論ログは 2 つの形式が混在する
+
+`inference-logs/` には形式の違う 2 種類のファイルが並ぶ。
+
+| 由来 | 特徴量 | 予測 |
+|---|---|---|
+| ローカル / エンドポイント（`inference_logger`） | `features` の下にネスト | `prediction` / `probability` |
+| Batch Transform（JoinSource） | 最上位 | `SageMakerOutput` の下 |
+
+`drift_check` はファイル単位で形式を揃えてから結合する。
+
+最初は全ファイルを結合してから形式を判定していたが、混在すると `features` 列が一部の行だけ
+NaN になり `json_normalize` が失敗する。日付で絞って読む分には問題が出ないので、
+全期間を読んで初めて分かる種類の不具合だった。テストで固定している。
+
+### SageMaker Model は Transform Job と同じライフサイクルで扱う
+
+エンドポイントでは Model を Terraform で管理していたが、Batch Transform ではスクリプトが作って消す。
+Transform Job が終われば Model は不要で、残すと実行のたびに溜まる（課金は無い）。
+
+Step Functions に移すときも、同じワークフローの中で CreateModel → CreateTransformJob → DeleteModel と並べる。
+
+### drift_check のクラッシュを「ドリフトあり」と区別する
+
+`drift_check` の終了コードは 0（ドリフトなし）/ 1（ドリフトあり）/ 2（判定不能）で、
+`retrain_pipeline.sh` は 1 のときに再学習へ進む。
+
+ところが **Python の未捕捉例外も終了コード 1 を返す**。S3 の認証切れ、MLflow の停止、
+想定外の形式のログ、いずれでもクラッシュすると「ドリフトを検知した」と解釈されて再学習が走っていた。
+作業中だけでも SSO トークン切れと依存の欠落で 2 回クラッシュさせている。
+AWS で自動化すると、これは無駄な Training Job の課金になる。
+
+`promote.py` も同じ構造だが、あちらはクラッシュが 1（昇格拒否）になり、**安全側に倒れる**。
+`drift_check` は**危険側に倒れる**点が違った。
+
+対処は 2 か所。
+
+- `drift_check` の想定外の例外を捕まえて終了コード 2 にする（意図した `SystemExit` は再送出する）
+- `retrain_pipeline.sh` を「0 と 2 以外は再学習」から「1 だけが再学習、それ以外は判定不能」に反転する
+
+存在しないバケットを指定して確かめた。
+
+    drift_check failed: NoSuchBucket: An error occurred (NoSuchBucket) ...
+    exit: 2
+
+終了コードで分岐する設計は一般的だが、言語ランタイムが既定で返すコードと意味が衝突していないかは
+確認しておく必要がある。
+
 ## セキュリティ
 
 - 認証情報は `.env` に外出し（`.env.example` を参照）
@@ -548,8 +711,8 @@ Terraform はタグ文字列しか見ないので差分が出ず、古いイメ�
 | MLflow server | 使わない（ローカル専用） | 方針確定 |
 | Model Registry alias | SageMaker Model Registry approval status | 未着手 |
 | `train.py` | SageMaker Training Job | 完了 |
-| FastAPI (Docker) | SageMaker Serverless Inference | **失敗**（Real-time では動作確認済み） |
-| `drift_check.py` | Lambda（Serverless では Model Monitor が使えない） | 未着手 |
+| FastAPI (Docker) | SageMaker Batch Transform | 完了（Serverless Inference は**失敗**して保留） |
+| `drift_check.py` | 同じコードを AWS 上のデータに対して実行 | 手動で完了。Lambda 化は未着手 |
 | `retrain_pipeline.sh` | Step Functions + EventBridge | 未着手 |
 
 ## 今後
@@ -560,9 +723,11 @@ AWS
 - [x] GitHub Actions から OIDC で plan / apply / push
 - [x] ECR と SageMaker Training Job で学習を AWS に出す
 - [x] エンドポイントを立てて推論ログを S3 に溜める（Real-time で確認）
-- [ ] Serverless Inference での作成失敗を解決する
+- [x] Batch Transform でバッチ推論し、特徴量込みの推論ログを S3 に出す
+- [x] drift_check を AWS 上のデータとベースラインだけで動かす
 - [ ] Model Registry の approval status で昇格を管理する
-- [ ] drift_check / promote を Lambda + EventBridge で自動化
+- [ ] Batch Transform → drift_check → 再学習 → 昇格判定 を Step Functions で自動化
+- [ ] Serverless Inference での作成失敗を解決する（保留）
 
 その他
 
