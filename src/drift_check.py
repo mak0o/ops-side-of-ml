@@ -1,12 +1,18 @@
-"""推論ログとベースラインを比較してドリフトを検知する。"""
+"""推論ログとベースラインを比較してドリフトを検知する。
+
+ベースラインの取得元は2つ。
+- ローカル: MLflow の production alias が指す run の artifact
+- AWS: model.tar.gz に同梱した baseline.json（--model-artifact で指定）
+"""
 
 import argparse
 import io
 import json
 import os
+import tarfile
+from urllib.parse import urlparse
 
 import boto3
-import mlflow
 import numpy as np
 import pandas as pd
 
@@ -17,8 +23,11 @@ PREFIX = os.getenv("INFERENCE_LOG_PREFIX", "inference-logs")
 MODEL_NAME = "cost-anomaly-detector"
 
 
-def load_baseline(alias: str) -> dict:
+def load_baseline_from_mlflow(alias: str) -> dict:
     """production alias が指すモデルの run から baseline.json を取得する。"""
+    # mlflow はローカル専用。AWS 側の実行環境に含めないため関数内で import する。
+    import mlflow
+
     client = mlflow.MlflowClient()
     mv = client.get_model_version_by_alias(MODEL_NAME, alias)
     path = mlflow.artifacts.download_artifacts(
@@ -28,39 +37,67 @@ def load_baseline(alias: str) -> dict:
         return json.load(f)
 
 
+def load_baseline_from_artifact(artifact_uri: str) -> dict:
+    """model.tar.gz に同梱した baseline.json を取り出す。
+
+    学習時に run_sagemaker() がモデルと同じ tar に入れているので、
+    モデルとベースラインの対応が崩れない。
+    """
+    parsed = urlparse(artifact_uri)
+    s3 = boto3.client("s3")
+    body = s3.get_object(Bucket=parsed.netloc, Key=parsed.path.lstrip("/"))["Body"].read()
+
+    with tarfile.open(fileobj=io.BytesIO(body), mode="r:gz") as tar:
+        member = tar.extractfile("baseline.json")
+        if member is None:
+            raise SystemExit(f"{artifact_uri} に baseline.json がありません")
+        return json.load(member)
+
+
+def _normalize(df: pd.DataFrame) -> pd.DataFrame:
+    """推論ログを特徴量が最上位に並ぶ形に揃える。
+
+    ローカルの inference_logger はネストした features を書くが、
+    Batch Transform の出力は特徴量が最上位に来る。
+    混在してもよいよう、ファイル単位で揃えてから結合する。
+    """
+    if "features" in df.columns:
+        features = pd.json_normalize(df["features"])
+        return pd.concat([df.drop(columns=["features"]), features], axis=1)
+    return df
+
+
 def load_inference_logs(prefix: str) -> pd.DataFrame:
-    s3 = boto3.client("s3", endpoint_url=os.getenv("MLFLOW_S3_ENDPOINT_URL"))
+    s3 = boto3.client("s3", endpoint_url=os.getenv("MLFLOW_S3_ENDPOINT_URL") or None)
     paginator = s3.get_paginator("list_objects_v2")
 
     frames = []
     for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
         for obj in page.get("Contents", []):
             body = s3.get_object(Bucket=BUCKET, Key=obj["Key"])["Body"].read()
-            frames.append(pd.read_json(io.BytesIO(body), lines=True))
+            frames.append(_normalize(pd.read_json(io.BytesIO(body), lines=True)))
 
     if not frames:
         return pd.DataFrame()
 
-    df = pd.concat(frames, ignore_index=True)
-
-    # ローカルの inference_logger はネストした features を書くが、
-    # Batch Transform の出力は特徴量が最上位に来る。
-    if "features" in df.columns:
-        features = pd.json_normalize(df["features"])
-        return pd.concat([df.drop(columns=["features"]), features], axis=1)
-
-    return df
+    return pd.concat(frames, ignore_index=True)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--alias", default="production")
+    parser.add_argument("--model-artifact", default=None,
+                        help="指定すると MLflow ではなく model.tar.gz からベースラインを読む")
     parser.add_argument("--prefix", default=PREFIX,
                         help="推論ログのS3プレフィックス。日付で絞る場合に指定")
     parser.add_argument("--threshold", type=float, default=0.25)
     args = parser.parse_args()
 
-    baseline = load_baseline(args.alias)
+    if args.model_artifact:
+        baseline = load_baseline_from_artifact(args.model_artifact)
+    else:
+        baseline = load_baseline_from_mlflow(args.alias)
+
     logs = load_inference_logs(args.prefix)
 
     if logs.empty:
