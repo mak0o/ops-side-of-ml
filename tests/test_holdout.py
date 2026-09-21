@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.holdout import check_holdout, score
+from src.holdout import check_holdout, discordance, score
 
 
 class RecordingModel:
@@ -49,3 +49,11 @@ def test_refuses_holdout_without_labels():
     with pytest.raises(SystemExit) as e:
         check_holdout(df)
     assert e.value.code == 2
+
+
+def test_discordance_counts_only_rows_where_models_disagree():
+    y = [1, 1, 0, 0, 0]
+    current = [1, 0, 1, 0, 1]    # 正しい: 行0, 行3
+    candidate = [1, 1, 0, 0, 1]  # 正しい: 行0, 行1, 行2, 行3
+    # 候補だけが正しい: 行1, 行2 / 現行だけが正しい: なし / 両方誤り: 行4
+    assert discordance(y, current, candidate) == (2, 0)

@@ -1,6 +1,6 @@
 """昇格判定ロジックのテスト。"""
 
-from src.promote import _metrics_from_package, evaluate
+from src.promote import _metrics_from_package, evaluate, mcnemar_p, significance_check
 
 GOOD = {"f2": 0.833, "precision": 0.778, "recall": 0.848}
 
@@ -50,3 +50,25 @@ def test_package_metadata_is_converted_to_float():
     }}
     metrics = _metrics_from_package(desc)
     assert metrics == {"f2": 0.815, "precision": 0.7255}
+
+
+
+
+def test_mcnemar_one_sided_p_values():
+    """片側の正確な McNemar。二項分布の裾の和。"""
+    assert mcnemar_p(3, 0) == 0.125
+    assert mcnemar_p(5, 0) == 1 / 32
+    assert mcnemar_p(7, 1) == 9 / 256
+    assert mcnemar_p(0, 0) == 1.0
+
+
+def test_three_rows_are_not_enough():
+    """v1 と v6 の実例。誤報 3 件の差では、α=0.05 で昇格しない。"""
+    name, ok, _ = significance_check(3, 0, alpha=0.05)
+    assert name == "mcnemar"
+    assert not ok
+
+
+def test_five_one_sided_rows_are_enough():
+    _, ok, _ = significance_check(5, 0, alpha=0.05)
+    assert ok
