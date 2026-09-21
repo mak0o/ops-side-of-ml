@@ -1,29 +1,30 @@
-"""候補モデルを現行モデルと比較し、基準を満たせば production alias を移動する。
+"""候補モデルを現行モデルと比較し、基準を満たせば昇格する。
 
 見逃し（未検知の異常）のほうが誤検知より損失が大きいため、F2 を主指標にする。
 ただし F2 だけでは precision が崩壊しても「改善」と判定されうるので、
 precision と recall に下限を設けている。
+
+昇格先は2つ。
+- ローカル: MLflow の production alias を付け替える（--candidate）
+- AWS: SageMaker Model Package の approval status を Approved にする（--model-package-arn）
 """
 
 import argparse
 
-import mlflow
+import boto3
 
 MODEL_NAME = "cost-anomaly-detector"
 ALIAS = "production"
+REGION = "ap-northeast-1"
 
 PRIMARY_METRIC = "f2"
 MIN_PRECISION = 0.60
 MIN_RECALL = 0.80
 
 
-def get_metrics(client: mlflow.MlflowClient, run_id: str) -> dict:
-    return client.get_run(run_id).data.metrics
-
-
 def evaluate(current: dict | None, candidate: dict,
              min_precision: float, min_recall: float) -> list[tuple[str, bool, str]]:
-    """昇格可否のチェック結果を返す。MLflow に依存しない純粋関数。"""
+    """昇格可否のチェック結果を返す。レジストリに依存しない純粋関数。"""
     checks = []
 
     if current is None:
@@ -45,40 +46,122 @@ def evaluate(current: dict | None, candidate: dict,
     return checks
 
 
+# --- MLflow（ローカル） ---
+
+def _load_mlflow(candidate_version: int):
+    # mlflow はローカル専用。AWS 側の実行環境に含めないため関数内で import する。
+    import mlflow
+
+    client = mlflow.MlflowClient()
+    cand_mv = client.get_model_version(MODEL_NAME, str(candidate_version))
+    cand = client.get_run(cand_mv.run_id).data.metrics
+    cand_label = f"v{candidate_version}"
+
+    # alias の有無は例外ではなく明示的に確認する。
+    # 接続失敗などを「現行なし」と取り違えると、比較せずに昇格してしまう。
+    aliases = client.get_registered_model(MODEL_NAME).aliases
+    if ALIAS not in aliases:
+        return None, None, cand, cand_label
+
+    cur_mv = client.get_model_version(MODEL_NAME, str(aliases[ALIAS]))
+    curr = client.get_run(cur_mv.run_id).data.metrics
+    return curr, f"v{cur_mv.version}", cand, cand_label
+
+
+def _promote_mlflow(candidate_version: int) -> None:
+    import mlflow
+
+    mlflow.MlflowClient().set_registered_model_alias(
+        MODEL_NAME, ALIAS, str(candidate_version)
+    )
+    print(f"PROMOTED: {ALIAS} -> version {candidate_version}")
+    print("推論APIを再起動してください: docker compose restart ml-app")
+
+
+# --- SageMaker（AWS） ---
+
+def _metrics_from_package(desc: dict) -> dict:
+    """CustomerMetadataProperties は文字列しか持てないので float に戻す。
+
+    training_job のような数値でない値は捨てる。
+    """
+    metrics = {}
+    for key, value in desc.get("CustomerMetadataProperties", {}).items():
+        try:
+            metrics[key] = float(value)
+        except ValueError:
+            continue
+    return metrics
+
+
+def _load_sagemaker(sm, candidate_arn: str):
+    cand_desc = sm.describe_model_package(ModelPackageName=candidate_arn)
+    cand = _metrics_from_package(cand_desc)
+    cand_label = f"v{cand_desc['ModelPackageVersion']}"
+    group = cand_desc["ModelPackageGroupName"]
+
+    # 最新の Approved を現行とみなす。候補自身は比較対象から除く。
+    resp = sm.list_model_packages(
+        ModelPackageGroupName=group,
+        ModelApprovalStatus="Approved",
+        SortBy="CreationTime",
+        SortOrder="Descending",
+        MaxResults=10,
+    )
+    approved = [
+        p for p in resp["ModelPackageSummaryList"]
+        if p["ModelPackageArn"] != candidate_arn
+    ]
+    if not approved:
+        return None, None, cand, cand_label
+
+    cur_desc = sm.describe_model_package(ModelPackageName=approved[0]["ModelPackageArn"])
+    curr = _metrics_from_package(cur_desc)
+    return curr, f"v{cur_desc['ModelPackageVersion']}", cand, cand_label
+
+
+def _set_status(sm, arn: str, status: str, reason: str) -> None:
+    sm.update_model_package(
+        ModelPackageArn=arn,
+        ModelApprovalStatus=status,
+        ApprovalDescription=reason[:1000],
+    )
+
+
+# --- 共通 ---
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--candidate", type=int, required=True,
-                        help="昇格を検討するモデルバージョン")
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--candidate", type=int,
+                        help="昇格を検討する MLflow のモデルバージョン")
+    target.add_argument("--model-package-arn",
+                        help="昇格を検討する SageMaker Model Package の ARN")
     parser.add_argument("--dry-run", action="store_true",
-                        help="判定のみ行い alias は移動しない")
+                        help="判定のみ行い、alias も approval status も変更しない")
     parser.add_argument("--min-precision", type=float, default=MIN_PRECISION)
     parser.add_argument("--min-recall", type=float, default=MIN_RECALL)
     args = parser.parse_args()
 
-    client = mlflow.MlflowClient()
-
-    candidate = client.get_model_version(MODEL_NAME, str(args.candidate))
-    cand = get_metrics(client, candidate.run_id)
-
-    try:
-        current = client.get_model_version_by_alias(MODEL_NAME, ALIAS)
-        curr = get_metrics(client, current.run_id)
-        current_version = current.version
-    except Exception:
-        curr, current_version = None, None
+    sm = None
+    if args.model_package_arn:
+        sm = boto3.client("sagemaker", region_name=REGION)
+        curr, curr_label, cand, cand_label = _load_sagemaker(sm, args.model_package_arn)
+    else:
+        curr, curr_label, cand, cand_label = _load_mlflow(args.candidate)
 
     def fmt(metrics: dict, key: str) -> str:
         return f"{metrics[key]:.3f}" if key in metrics else "n/a"
 
-    if current_version:
-        print(f"current  (v{current_version}): "
+    if curr_label:
+        print(f"current  ({curr_label}): "
               f"f2={fmt(curr, 'f2')}  "
               f"precision={fmt(curr, 'precision')}  "
               f"recall={fmt(curr, 'recall')}")
     else:
         print("current: none (初回昇格)")
 
-    print(f"candidate(v{args.candidate}): "
+    print(f"candidate({cand_label}): "
           f"f2={fmt(cand, 'f2')}  "
           f"precision={fmt(cand, 'precision')}  "
           f"recall={fmt(cand, 'recall')}")
@@ -86,12 +169,12 @@ def main() -> None:
 
     if curr is not None:
         if PRIMARY_METRIC not in curr:
-            print(f"ERROR: 現行モデル v{current_version} に "
+            print(f"ERROR: 現行モデル {curr_label} に "
                   f"'{PRIMARY_METRIC}' が記録されていません。")
             print("同じ指標で再評価してから比較してください。")
             raise SystemExit(2)
         if PRIMARY_METRIC not in cand:
-            print(f"ERROR: 候補モデル v{args.candidate} に "
+            print(f"ERROR: 候補モデル {cand_label} に "
                   f"'{PRIMARY_METRIC}' が記録されていません。")
             raise SystemExit(2)
 
@@ -102,17 +185,33 @@ def main() -> None:
     print()
 
     if not all(ok for _, ok, _ in checks):
-        print(f"REJECT: version {args.candidate} は昇格基準を満たしません")
+        print(f"REJECT: {cand_label} は昇格基準を満たしません")
+        if sm and not args.dry_run:
+            # 判定結果をパッケージ側に残す。後から理由を追える。
+            failed = ", ".join(f"{n}: {d}" for n, ok, d in checks if not ok)
+            _set_status(sm, args.model_package_arn, "Rejected", f"promote.py: {failed}")
+            print("status: Rejected")
         raise SystemExit(1)
 
     if args.dry_run:
-        print(f"PROMOTE (dry-run): version {args.candidate} は昇格可能です")
+        print(f"PROMOTE (dry-run): {cand_label} は昇格可能です")
         return
 
-    client.set_registered_model_alias(MODEL_NAME, ALIAS, str(args.candidate))
-    print(f"PROMOTED: {ALIAS} -> version {args.candidate}")
-    print("推論APIを再起動してください: docker compose restart ml-app")
+    if sm:
+        detail = "; ".join(f"{n}: {d}" for n, _, d in checks)
+        _set_status(sm, args.model_package_arn, "Approved", f"promote.py: {detail}")
+        print(f"PROMOTED: {cand_label} -> Approved")
+    else:
+        _promote_mlflow(args.candidate)
 
 
 if __name__ == "__main__":
-    main()
+    # 未捕捉の例外は終了コード 1（昇格拒否）と区別できない。
+    # 想定外の失敗は判定不能 (2) にする。
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"promote failed: {type(e).__name__}: {e}")
+        raise SystemExit(2) from e
