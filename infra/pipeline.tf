@@ -618,7 +618,9 @@ resource "aws_iam_role" "scheduler" {
 data "aws_iam_policy_document" "scheduler" {
   statement {
     actions   = ["states:StartExecution"]
-    resources = [aws_sfn_state_machine.pipeline.arn]
+    # ステートマシンの属性を参照すると、定義を変えるたびに plan でこのポリシーも
+    # 変更扱いになる。名前は固定なので ARN を組み立てて依存を切る。
+    resources = ["arn:aws:states:${var.region}:${local.account_id}:stateMachine:${local.pipeline_name}"]
   }
 }
 
