@@ -91,6 +91,8 @@ def main() -> None:
     parser.add_argument("--prefix", default=PREFIX,
                         help="推論ログのS3プレフィックス。日付で絞る場合に指定")
     parser.add_argument("--threshold", type=float, default=0.25)
+    parser.add_argument("--min-samples", type=int, default=100,
+                        help="これ未満は判定不能として終了コード 2 を返す")
     args = parser.parse_args()
 
     if args.model_artifact:
@@ -102,6 +104,12 @@ def main() -> None:
 
     if logs.empty:
         print("no inference logs found")
+        raise SystemExit(2)
+
+    # PSI は10ビンの構成比で比べるので、件数が少ないと空のビンができて値が跳ねる。
+    # 51件で同一母集団でも significant が出たため、判定不能として止める。
+    if len(logs) < args.min_samples:
+        print(f"samples {len(logs)} < {args.min_samples}: 判定に必要な件数に達していません")
         raise SystemExit(2)
 
     print(f"baseline: {baseline['n_samples']} samples")
@@ -130,6 +138,13 @@ def main() -> None:
         raise SystemExit(1)
     print("no significant drift")
 
-
 if __name__ == "__main__":
-    main()
+    # 未捕捉の例外は終了コード 1 になり、「ドリフトあり」と区別できない。
+    # クラッシュで再学習が走らないよう、想定外の失敗は判定不能 (2) にする。
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"drift_check failed: {type(e).__name__}: {e}")
+        raise SystemExit(2) from e

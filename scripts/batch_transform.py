@@ -33,6 +33,8 @@ def main() -> None:
     parser.add_argument("--data", type=Path, default=Path("data/cost.parquet"))
     parser.add_argument("--limit", type=int, default=200,
                         help="推論する行数。SingleRecord なので 1 行 1 リクエストになる")
+    parser.add_argument("--sample", action="store_true",
+                        help="先頭からではなくランダムに抽出する")
     parser.add_argument("--model-artifact", type=str, required=True)
     parser.add_argument("--image-tag", type=str, default="latest")
     parser.add_argument("--instance-type", type=str, default="ml.m5.large")
@@ -55,7 +57,14 @@ def main() -> None:
 
     # --- 入力を JSON Lines に変換して S3 に置く ---
     # parquet のままでは Batch Transform が 1 レコードずつ切り出せない。
-    df = pd.read_parquet(args.data).head(args.limit)[FEATURES]
+    df = pd.read_parquet(args.data)
+    # head() は期間の先頭に偏る。分布を比べる検証ではランダム抽出を使う。
+    if args.sample:
+        df = df.sample(n=min(args.limit, len(df)), random_state=42)
+    else:
+        df = df.head(args.limit)
+    df = df[FEATURES]
+
     local = Path(f"/tmp/{job_name}.jsonl")
     local.write_text(
         "\n".join(json.dumps(r) for r in df.to_dict(orient="records"))
