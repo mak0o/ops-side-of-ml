@@ -13,6 +13,8 @@ from pathlib import Path
 import boto3
 import pandas as pd
 
+from src.registry import container, latest_approved
+
 REGION = "ap-northeast-1"
 PROJECT = "ops-side-of-ml"
 MODEL_NAME = "cost-anomaly-detector"
@@ -35,7 +37,11 @@ def main() -> None:
                         help="推論する行数。SingleRecord なので 1 行 1 リクエストになる")
     parser.add_argument("--sample", action="store_true",
                         help="先頭からではなくランダムに抽出する")
-    parser.add_argument("--model-artifact", type=str, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--model-package-group", type=str,
+                        help="最新の Approved パッケージのモデルとイメージを使う")
+    source.add_argument("--model-artifact", type=str,
+                        help="model.tar.gz を直接指定する（--image-tag と併用）")
     parser.add_argument("--image-tag", type=str, default="latest")
     parser.add_argument("--instance-type", type=str, default="ml.m5.large")
     parser.add_argument("--join-input", action="store_true",
@@ -45,7 +51,22 @@ def main() -> None:
 
     account = boto3.client("sts", region_name=REGION).get_caller_identity()["Account"]
     bucket = f"{PROJECT}-{account}"
-    image = f"{account}.dkr.ecr.{REGION}.amazonaws.com/{PROJECT}/serve:{args.image_tag}"
+    sm = boto3.client("sagemaker", region_name=REGION)
+
+    if args.model_package_group:
+        # パッケージはイメージと成果物をセットで持っているので、両方ここから決まる。
+        desc = latest_approved(sm, args.model_package_group)
+        if desc is None:
+            raise SystemExit(f"{args.model_package_group} に Approved のモデルがありません")
+        c = container(desc)
+        image, artifact = c["Image"], c["ModelDataUrl"]
+        model_version = f"{args.model_package_group}/{desc['ModelPackageVersion']}"
+    else:
+        image = f"{account}.dkr.ecr.{REGION}.amazonaws.com/{PROJECT}/serve:{args.image_tag}"
+        artifact = args.model_artifact
+        model_version = args.image_tag
+
+    print(f"package: {model_version}")
     role = f"arn:aws:iam::{account}:role/{PROJECT}-sagemaker-execution"
 
     now = datetime.now(UTC)
@@ -75,7 +96,6 @@ def main() -> None:
     s3.upload_file(str(local), bucket, input_key)
     print(f"uploaded: s3://{bucket}/{input_key} ({len(df)} rows)")
 
-    sm = boto3.client("sagemaker", region_name=REGION)
 
     # --- Model を作る ---
     # エンドポイントを destroy したので Terraform 側には存在しない。
@@ -86,15 +106,15 @@ def main() -> None:
         ExecutionRoleArn=role,
         PrimaryContainer={
             "Image": image,
-            "ModelDataUrl": args.model_artifact,
+            "ModelDataUrl": artifact,
             "Environment": {
                 # Batch Transform は出力を S3 に書くので自前のログ書き出しは不要。
                 "INFERENCE_LOG_ENABLED": "0",
-                "MODEL_VERSION": args.image_tag,
+                "MODEL_VERSION": model_version,
             },
         },
     )
-    print(f"model: {model_name}")
+    print(f"sagemaker model: {model_name}")
 
     # --- Transform Job ---
     params = {
@@ -147,7 +167,7 @@ def main() -> None:
 
     # Transform Job が終われば Model は不要。残すと溜まり続ける。
     sm.delete_model(ModelName=model_name)
-    print(f"deleted model: {model_name}")
+    print(f"deleted sagemaker model: {model_name}")
 
 def _wait(sm, job_name: str, bucket: str) -> None:
     while True:

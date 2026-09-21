@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 
 from src.baseline import interpret, psi
+from src.registry import REGION, container, latest_approved
 
 BUCKET = os.getenv("INFERENCE_LOG_BUCKET", "mlflow-bucket")
 PREFIX = os.getenv("INFERENCE_LOG_PREFIX", "inference-logs")
@@ -88,6 +89,8 @@ def main() -> None:
     parser.add_argument("--alias", default="production")
     parser.add_argument("--model-artifact", default=None,
                         help="指定すると MLflow ではなく model.tar.gz からベースラインを読む")
+    parser.add_argument("--model-package-group", default=None,
+                        help="指定すると最新の Approved パッケージからベースラインを読む")
     parser.add_argument("--prefix", default=PREFIX,
                         help="推論ログのS3プレフィックス。日付で絞る場合に指定")
     parser.add_argument("--threshold", type=float, default=0.25)
@@ -95,10 +98,21 @@ def main() -> None:
                         help="これ未満は判定不能として終了コード 2 を返す")
     args = parser.parse_args()
 
-    if args.model_artifact:
+
+    if args.model_package_group:
+        sm = boto3.client("sagemaker", region_name=REGION)
+        desc = latest_approved(sm, args.model_package_group)
+        if desc is None:
+            print(f"{args.model_package_group} に Approved のモデルがありません")
+            raise SystemExit(2)
+        artifact = container(desc)["ModelDataUrl"]
+        print(f"model: v{desc['ModelPackageVersion']} ({artifact})")
+        baseline = load_baseline_from_artifact(artifact)
+    elif args.model_artifact:
         baseline = load_baseline_from_artifact(args.model_artifact)
     else:
         baseline = load_baseline_from_mlflow(args.alias)
+   
 
     logs = load_inference_logs(args.prefix)
 

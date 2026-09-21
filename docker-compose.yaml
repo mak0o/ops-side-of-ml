@@ -116,6 +116,7 @@ services:
     environment:
       - AWS_REGION=ap-northeast-1
       - AWS_PROFILE=${AWS_PROFILE}
+      - PYTHONPATH=/work
     profiles: ["tools"]
   
 networks:
