@@ -8,6 +8,7 @@ import io
 from urllib.parse import urlparse
 
 import boto3
+import numpy as np
 import pandas as pd
 
 from src.metrics import compute_metrics
@@ -52,8 +53,28 @@ def check_holdout(df: pd.DataFrame, min_positives: int = MIN_POSITIVES) -> None:
         raise SystemExit(2)
 
 
-def score(model, features: list[str], df: pd.DataFrame) -> dict:
-    """モデルをホールドアウトで推論し、指標を返す。列順は学習時の features.json に従う。"""
+def evaluate_model(model, features: list[str], df: pd.DataFrame) -> tuple[dict, np.ndarray]:
+    """モデルをホールドアウトで推論し、指標と行ごとの予測を返す。
+
+    列順は学習時の features.json に従う。予測は現行と候補の食い違いを数えるのに使う。
+    """
     X = df[features]
     y = df[TARGET]
-    return compute_metrics(y, model.predict(X), model.predict_proba(X)[:, 1])
+    pred = model.predict(X)
+    return compute_metrics(y, pred, model.predict_proba(X)[:, 1]), pred
+
+
+def score(model, features: list[str], df: pd.DataFrame) -> dict:
+    """指標だけが要るとき用。"""
+    return evaluate_model(model, features, df)[0]
+
+
+def discordance(y, pred_current, pred_candidate) -> tuple[int, int]:
+    """判定が食い違った行を数える。(候補だけが正しい行, 現行だけが正しい行)。
+
+    両モデルとも正しい行、両方とも誤った行は差を生まないので数えない。
+    """
+    y = np.asarray(y).astype(bool)
+    current_ok = np.asarray(pred_current).astype(bool) == y
+    candidate_ok = np.asarray(pred_candidate).astype(bool) == y
+    return int((~current_ok & candidate_ok).sum()), int((current_ok & ~candidate_ok).sum())

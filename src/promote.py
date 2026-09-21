@@ -11,6 +11,7 @@ precision と recall に下限を設けている。
 """
 
 import argparse
+import math
 
 import boto3
 
@@ -22,6 +23,9 @@ ALIAS = "production"
 PRIMARY_METRIC = "f2"
 MIN_PRECISION = 0.60
 MIN_RECALL = 0.80
+# 食い違った行が候補に偏っているかの有意水準。
+# 300 行・異常 30 件のホールドアウトでは、誤報の減少なら 5 件以上の差が要る。
+ALPHA = 0.05
 
 
 def evaluate(current: dict | None, candidate: dict,
@@ -48,8 +52,35 @@ def evaluate(current: dict | None, candidate: dict,
     return checks
 
 
+def mcnemar_p(candidate_only: int, current_only: int) -> float:
+    """片側の正確な McNemar 検定の p 値。
+
+    判定が食い違った行のうち、候補だけが正しかった行の数が、
+    五分五分の実力でも偶然これ以上になる確率。食い違いが無ければ 1.0。
+    """
+    n = candidate_only + current_only
+    if n == 0:
+        return 1.0
+    return sum(math.comb(n, k) for k in range(candidate_only, n + 1)) / 2**n
+
+
+def significance_check(candidate_only: int, current_only: int,
+                       alpha: float = ALPHA) -> tuple[str, bool, str]:
+    """差が偶然でないかのチェック。evaluate() の結果に追加して使う。
+
+    ブートストラップの百分位点は、食い違いが少なく片側に偏っているときに過信する
+    （手元の行を母集団とみなすので、候補が負けた行が無ければ負ける標本も作れない）。
+    そのため食い違った行の偏りを直接検定する。
+    """
+    p = mcnemar_p(candidate_only, current_only)
+    return ("mcnemar", p < alpha,
+            f"{candidate_only}:{current_only} p={p:.3f} < {alpha:.2f}")
+
+
 def judge(curr: dict | None, curr_label: str | None, cand: dict, cand_label: str,
-          min_precision: float, min_recall: float) -> list[tuple[str, bool, str]]:
+          min_precision: float, min_recall: float,
+          extra_checks: list[tuple[str, bool, str]] | None = None,
+          ) -> list[tuple[str, bool, str]]:
     """現行と候補を表示し、判定結果を返す。指標が欠けていたら判定不能で止める。"""
 
     def fmt(metrics: dict, key: str) -> str:
@@ -80,7 +111,7 @@ def judge(curr: dict | None, curr_label: str | None, cand: dict, cand_label: str
                   f"'{PRIMARY_METRIC}' が記録されていません。")
             raise SystemExit(2)
 
-    checks = evaluate(curr, cand, min_precision, min_recall)
+    checks = evaluate(curr, cand, min_precision, min_recall) + (extra_checks or [])
     for name, ok, detail in checks:
         print(f"{name:<12} {detail:<30} {'PASS' if ok else 'FAIL'}")
     print()
@@ -161,14 +192,16 @@ def _set_status(sm, arn: str, status: str, reason: str) -> None:
 def decide_package(sm, arn: str, curr: dict | None, curr_label: str | None,
                    cand: dict, cand_label: str,
                    min_precision: float = MIN_PRECISION, min_recall: float = MIN_RECALL,
-                   dry_run: bool = False, basis: str = "registered") -> bool:
+                   dry_run: bool = False, basis: str = "registered",
+                   extra_checks: list[tuple[str, bool, str]] | None = None) -> bool:
     """与えられた指標で判定し、Approved / Rejected を付ける。昇格したら True。
 
     basis は比較に使った数値の出どころ。記録に残して、後から判定の根拠を区別できるようにする。
       registered: 登録時の指標（各モデルが別々のデータで測った値）
       holdout:    同じホールドアウトで測った値
     """
-    checks = judge(curr, curr_label, cand, cand_label, min_precision, min_recall)
+    checks = judge(curr, curr_label, cand, cand_label, min_precision, min_recall,
+                   extra_checks)
     source = f"promote.py ({basis})"
 
     if not all(ok for _, ok, _ in checks):

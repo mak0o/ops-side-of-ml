@@ -16,8 +16,15 @@ import json
 
 import boto3
 
-from src.holdout import MIN_POSITIVES, check_holdout, load_holdout, score
-from src.promote import MIN_PRECISION, MIN_RECALL, decide_package, promote_package
+from src.holdout import MIN_POSITIVES, check_holdout, discordance, evaluate_model, load_holdout
+from src.promote import (
+    ALPHA,
+    MIN_PRECISION,
+    MIN_RECALL,
+    decide_package,
+    promote_package,
+    significance_check,
+)
 from src.registry import (
     MODEL_PACKAGE_GROUP,
     REGION,
@@ -47,6 +54,8 @@ def main() -> None:
     parser.add_argument("--result-s3-uri", default=None)
     parser.add_argument("--min-precision", type=float, default=MIN_PRECISION)
     parser.add_argument("--min-recall", type=float, default=MIN_RECALL)
+    parser.add_argument("--alpha", type=float, default=ALPHA,
+                        help="食い違った行が候補に偏っているかの有意水準")
     args = parser.parse_args()
 
     sm = boto3.client("sagemaker", region_name=REGION)
@@ -74,15 +83,22 @@ def main() -> None:
     cand_label = f"v{cand_desc['ModelPackageVersion']}"
 
     cand_model, cand_features = load_model(desc["ModelArtifacts"]["S3ModelArtifacts"])
-    cand = score(cand_model, cand_features, holdout)
+    cand, cand_pred = evaluate_model(cand_model, cand_features, holdout)
 
+    extra_checks = []
+    discordant = None
     cur_desc = latest_approved(sm, args.group, exclude_arn=arn)
     if cur_desc is None:
         curr, curr_label = None, None
     else:
         cur_model, cur_features = load_model(container(cur_desc)["ModelDataUrl"])
-        curr = score(cur_model, cur_features, holdout)
+        curr, cur_pred = evaluate_model(cur_model, cur_features, holdout)
         curr_label = f"v{cur_desc['ModelPackageVersion']}"
+
+        # F2 の差が偶然でないかを、判定が食い違った行の偏りで確かめる
+        cand_only, cur_only = discordance(holdout["is_anomaly"], cur_pred, cand_pred)
+        discordant = {"candidate_only": cand_only, "current_only": cur_only}
+        extra_checks.append(significance_check(cand_only, cur_only, args.alpha))
 
     # ホールドアウトでの成績を候補のパッケージにも残す。登録時の指標とは別の名前で持つ。
     sm.update_model_package(
@@ -92,7 +108,8 @@ def main() -> None:
 
     print()
     approved = decide_package(sm, arn, curr, curr_label, cand, cand_label,
-                              args.min_precision, args.min_recall, basis="holdout")
+                              args.min_precision, args.min_recall, basis="holdout",
+                              extra_checks=extra_checks)
 
     # 候補の判定とは別に、現行モデルが今のデータで下限を割っていないかを記録する。
     # 候補が拒否され、かつ現行も劣化している状態を黙って放置しないため。
@@ -112,6 +129,7 @@ def main() -> None:
         "current": curr_label,
         "current_holdout": _rounded(curr),
         "current_degraded": current_degraded,
+        "discordant": discordant,
     }
     _finish(result, args.result_s3_uri)
 
