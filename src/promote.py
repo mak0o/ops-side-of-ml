@@ -13,6 +13,8 @@ import argparse
 
 import boto3
 
+from src.registry import latest_approved
+
 MODEL_NAME = "cost-anomaly-detector"
 ALIAS = "production"
 REGION = "ap-northeast-1"
@@ -101,21 +103,10 @@ def _load_sagemaker(sm, candidate_arn: str):
     group = cand_desc["ModelPackageGroupName"]
 
     # 最新の Approved を現行とみなす。候補自身は比較対象から除く。
-    resp = sm.list_model_packages(
-        ModelPackageGroupName=group,
-        ModelApprovalStatus="Approved",
-        SortBy="CreationTime",
-        SortOrder="Descending",
-        MaxResults=10,
-    )
-    approved = [
-        p for p in resp["ModelPackageSummaryList"]
-        if p["ModelPackageArn"] != candidate_arn
-    ]
-    if not approved:
+    cur_desc = latest_approved(sm, group, exclude_arn=candidate_arn)
+    if cur_desc is None:
         return None, None, cand, cand_label
 
-    cur_desc = sm.describe_model_package(ModelPackageName=approved[0]["ModelPackageArn"])
     curr = _metrics_from_package(cur_desc)
     return curr, f"v{cur_desc['ModelPackageVersion']}", cand, cand_label
 
@@ -188,7 +179,7 @@ def main() -> None:
         print(f"REJECT: {cand_label} は昇格基準を満たしません")
         if sm and not args.dry_run:
             # 判定結果をパッケージ側に残す。後から理由を追える。
-            failed = ", ".join(f"{n}: {d}" for n, ok, d in checks if not ok)
+            failed = ", ".join(f"{n} FAIL ({d})" for n, ok, d in checks if not ok)
             _set_status(sm, args.model_package_arn, "Rejected", f"promote.py: {failed}")
             print("status: Rejected")
         raise SystemExit(1)
@@ -198,7 +189,7 @@ def main() -> None:
         return
 
     if sm:
-        detail = "; ".join(f"{n}: {d}" for n, _, d in checks)
+        detail = "; ".join(f"{n} PASS ({d})" for n, _, d in checks)
         _set_status(sm, args.model_package_arn, "Approved", f"promote.py: {detail}")
         print(f"PROMOTED: {cand_label} -> Approved")
     else:
