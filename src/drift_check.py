@@ -42,8 +42,14 @@ def load_inference_logs(prefix: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.concat(frames, ignore_index=True)
-    features = pd.json_normalize(df["features"])
-    return pd.concat([df.drop(columns=["features"]), features], axis=1)
+
+    # ローカルの inference_logger はネストした features を書くが、
+    # Batch Transform の出力は特徴量が最上位に来る。
+    if "features" in df.columns:
+        features = pd.json_normalize(df["features"])
+        return pd.concat([df.drop(columns=["features"]), features], axis=1)
+
+    return df
 
 
 def main() -> None:
