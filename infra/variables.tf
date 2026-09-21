@@ -18,3 +18,8 @@ variable "serve_image_tag" {
   description = "推論イメージのタグ。latest だと Terraform が変更を検知できないためコミットハッシュを推奨。"
   default     = "latest"
 }
+
+variable "pipeline_image_tag" {
+  type        = string
+  description = "パイプラインが使う train / serve イメージのタグ。image ジョブは同じコミットで両方をビルドするので1つで足りる。"
+}
