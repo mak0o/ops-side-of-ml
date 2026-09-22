@@ -1,0 +1,12 @@
+# Actions は SHA で固定しているので、更新は Dependabot に任せる。
+# SHA と末尾のバージョンのコメントをまとめて書き換えた PR が来る。
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # アクションの更新を 1 つの PR にまとめる
+    groups:
+      actions:
+        patterns: ["*"]
