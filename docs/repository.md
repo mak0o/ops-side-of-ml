@@ -44,10 +44,61 @@ Model Registry のテストでは SageMaker の偽物を使い、`list_model_pac
 
 ## セキュリティ
 
+### 基本方針
+
 - 認証情報は `.env` に外出し（`.env.example` を参照）
 - ローカルは全ポートを `127.0.0.1` にバインドし LAN に公開しない
 - 依存は `requirements.lock` / `requirements-dev.lock` / `requirements-train.lock` / `requirements-serve.lock` で完全固定。CI で全てを pip-audit にかける
 - AWS へのアクセスは OIDC のみ。長期のアクセスキーを発行していない
-- main はブランチ保護。直接 push を禁止し、`lint` / `test` / `scan` / `terraform-fmt` を必須チェックにしている
+- main はブランチ保護（バイパス無し）。直接 push を禁止し、`lint` / `test` / `scan` / `terraform-fmt` を必須チェックにしている
+- GitHub Actions のアクションはコミット SHA で固定し、Dependabot で更新する
+- ワークフローのトークンは必要な権限だけを宣言する（既定は `contents: read`）
 - コンテナは非 root ユーザーで実行（学習コンテナを除く。理由は [設計判断](decisions.md#学習コンテナは-root推論コンテナは非-root)）
 - CI で gitleaks（シークレット検出）と pip-audit（依存の脆弱性）を実行
+
+### 公開リポジトリとしての点検（2026 年 9 月）
+
+アカウントの乗っ取りや情報の露出を懸念して、公開している内容を点検した。
+
+**確認できたこと**
+
+| 懸念 | 結果 |
+|---|---|
+| 秘密情報の混入 | 全履歴（93 コミット）にアクセスキー、トークン、秘密鍵、`.env`、tfstate は無い |
+| メールアドレス | コミットは全て `…@users.noreply.github.com`。SNS の通知先もリポジトリに無い |
+| AWS の認証情報 | 長期アクセスキーを発行していない |
+| fork からの攻撃 | fork の PR には OIDC トークンが出ないので、AWS のロールを引けない |
+| SSO の情報 | SSO の開始 URL や管理者のプロファイル名は掲載していない |
+| AWS アカウント ID | ワークフローと tfvars に出ている。ARN に常に含まれる値で秘密情報ではないので許容している |
+
+**最大のリスク**
+
+漏えいではなく構造にある。GitHub アカウントを乗っ取られると、ブランチ保護を外して main に push でき、
+apply ロールを通じて AWS の変更権限をほぼ得られる（[apply ロールは実質的な特権ロール](decisions.md#apply-ロールは実質的な特権ロール)）。
+対策はここに集中させた。
+
+**実施した対策**
+
+| 対策 | 内容 |
+|---|---|
+| GitHub アカウントの保護 | 2 要素認証の強化、不要な Personal access token・OAuth アプリ・SSH キーの棚卸し、メールアドレスの非公開設定 |
+| GitHub の保護機能 | Secret scanning と Push protection、Dependabot alerts を有効化。外部からの fork の PR はワークフローの実行に承認を必須にした |
+| アクションの SHA 固定 | 全アクションを 40 桁のコミット SHA で固定。gitleaks のイメージは `latest` からバージョン固定に変更 |
+| Dependabot | アクションの更新を週 1 回、1 つの PR にまとめて提案させる |
+| スクリプトインジェクションの修正 | plan の出力を PR コメントのスクリプトに直接埋め込んでいたのを、環境変数経由に変更 |
+| トークンの権限の最小化 | `ci.yml` / `security.yml` に `contents: read` を宣言。`terraform.yml` は権限をジョブ単位にし、`pull-requests: write` を plan ジョブだけに付けた |
+| pip-audit の監査漏れ | `requirements-serve.lock` と `requirements-dev.lock` が監査されていなかったので追加した |
+
+**残っている対策**
+
+| 対策 | 理由 |
+|---|---|
+| 日常の作業で `AdministratorAccess` を使わない | パイプラインの確認程度なら、権限を絞った権限セットで足りる |
+| IAM Access Analyzer / Cost Anomaly Detection | どちらも無料。意図しない外部公開と、乗っ取りによる急な課金の増加を検知する |
+| apply ロールへの Permissions Boundary | ロール名のプレフィクスで絞っても権限昇格を防げていない。練習環境では見送り |
+| gitleaks のイメージの更新 | `run:` の中にあるので Dependabot が追えない。手で更新する |
+
+### リポジトリの外で気をつけること
+
+`aws sso login` の出力には SSO の開始 URL が、各種コマンドの出力にはアカウント ID が含まれる。
+ターミナルのログを公開するときは伏せる。開始 URL はフィッシングの材料になる。
