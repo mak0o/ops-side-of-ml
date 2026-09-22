@@ -83,7 +83,7 @@ apply ロールを通じて AWS の変更権限をほぼ得られる（[apply �
 |---|---|
 | GitHub アカウントの保護 | 2 要素認証の強化、不要な Personal access token・OAuth アプリ・SSH キーの棚卸し、メールアドレスの非公開設定 |
 | GitHub の保護機能 | Secret scanning と Push protection、Dependabot alerts を有効化。外部からの fork の PR はワークフローの実行に承認を必須にした |
-| アクションの SHA 固定 | 全アクションを 40 桁のコミット SHA で固定。gitleaks のイメージは `latest` からバージョン固定に変更 |
+| アクションの SHA 固定 | 全アクションを 40 桁のコミット SHA で固定。gitleaks のイメージは `latest` からダイジェスト固定に変更 |
 | Dependabot | アクションの更新を週 1 回、1 つの PR にまとめて提案させる |
 | スクリプトインジェクションの修正 | plan の出力を PR コメントのスクリプトに直接埋め込んでいたのを、環境変数経由に変更 |
 | トークンの権限の最小化 | `ci.yml` / `security.yml` に `contents: read` を宣言。`terraform.yml` は権限をジョブ単位にし、`pull-requests: write` を plan ジョブだけに付けた |
@@ -96,7 +96,7 @@ apply ロールを通じて AWS の変更権限をほぼ得られる（[apply �
 | 日常の作業で `AdministratorAccess` を使わない | パイプラインの確認程度なら、権限を絞った権限セットで足りる |
 | IAM Access Analyzer / Cost Anomaly Detection | どちらも無料。意図しない外部公開と、乗っ取りによる急な課金の増加を検知する |
 | apply ロールへの Permissions Boundary | ロール名のプレフィクスで絞っても権限昇格を防げていない。練習環境では見送り |
-| gitleaks のイメージの更新 | `run:` の中にあるので Dependabot が追えない。手で更新する |
+| gitleaks のイメージの更新 | ダイジェストで固定しているが、`run:` の中にあるので Dependabot が追えない。四半期に 1 回、手で確認して更新する |
 
 ### リポジトリの外で気をつけること
 
