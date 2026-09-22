@@ -179,6 +179,13 @@ data "aws_iam_policy_document" "sfn" {
     actions   = ["s3:GetObject"]
     resources = ["${aws_s3_bucket.artifacts.arn}/pipeline-results/*"]
   }
+
+  # 劣化と入れ替えの通知
+  statement {
+    sid       = "PublishAlerts"
+    actions   = ["sns:Publish"]
+    resources = [aws_sns_topic.alerts.arn]
+  }
 }
 
 resource "aws_iam_role_policy" "sfn" {
@@ -526,6 +533,35 @@ resource "aws_sfn_state_machine" "pipeline" {
           "result.$" = "States.StringToJson($.Body)"
         }
         ResultPath = "$.promote"
+        Next       = "IsDegraded"
+      }
+
+      # 候補の判定とは別に、現行が下限を割っていたら知らせる。
+      # 候補が拒否され、かつ現行も劣化している状態を黙って放置しないため。
+      IsDegraded = {
+        Type = "Choice"
+        Choices = [
+          {
+            And = [
+              { Variable = "$.promote.result.current_degraded", IsPresent = true },
+              { Variable = "$.promote.result.current_degraded", BooleanEquals = true },
+            ]
+            Next = "NotifyDegraded"
+          }
+        ]
+        Default = "IsApproved"
+      }
+
+      # SNS の Subject は ASCII のみ・100 文字未満。日本語は本文に書く。
+      NotifyDegraded = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::sns:publish"
+        Parameters = {
+          TopicArn    = aws_sns_topic.alerts.arn
+          Subject     = "[ops-side-of-ml] current model below thresholds"
+          "Message.$" = "States.Format('現行モデル {} がホールドアウトで下限を割りました。実行名: {} / 判定結果: {}', $.promote.result.current, $.run.name, States.JsonToString($.promote.result))"
+        }
+        ResultPath = null
         Next       = "IsApproved"
       }
 
@@ -535,10 +571,22 @@ resource "aws_sfn_state_machine" "pipeline" {
           {
             Variable      = "$.promote.result.approved"
             BooleanEquals = true
-            Next          = "Promoted"
+            Next          = "NotifyPromoted"
           }
         ]
         Default = "Rejected"
+      }
+
+      NotifyPromoted = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::sns:publish"
+        Parameters = {
+          TopicArn    = aws_sns_topic.alerts.arn
+          Subject     = "[ops-side-of-ml] model promoted"
+          "Message.$" = "States.Format('モデルが入れ替わりました。新しい現行: {} / 以前の現行: {} / 実行名: {} / 判定結果: {}', $.promote.result.model_package_arn, $.promote.result.current, $.run.name, States.JsonToString($.promote.result))"
+        }
+        ResultPath = null
+        Next       = "Promoted"
       }
 
       # どちらも正常な判定結果なので Succeed。状態名で結果を区別する。
