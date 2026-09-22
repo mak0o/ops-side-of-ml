@@ -61,6 +61,7 @@ data "aws_iam_policy_document" "gha_apply" {
       "lambda:*",
       "states:*",
       "scheduler:*",
+      "sns:*",
     ]
     resources = ["*"]
   }
