@@ -19,7 +19,7 @@
 - SageMaker Model Registry で世代管理（最新の Approved を現行とする）
 - 昇格判定：**期間で切ったホールドアウト**で現行と候補を同条件で評価し、下限と**片側 McNemar 検定**で判定
 - Step Functions で上記を 1 つのワークフローに。失敗・現行の劣化・モデルの入れ替えを SNS で通知
-- Terraform で全リソースを管理。GitHub Actions から OIDC で plan / apply / push（長期キーなし）
+- Terraform で全リソースを管理。GitHub Actions から OIDC で plan / apply / push（長期キーなし、アクションは SHA で固定）
 - アイドル時の課金ゼロ。月額は S3 と ECR で 10 円前後
 
 ## 構成
@@ -88,7 +88,7 @@ CI の apply ロールは権限をロール名のプレフィクスで絞って�
 | ML | scikit-learn（RandomForest）、pandas |
 | ローカル | Docker Compose、MLflow、MinIO |
 | AWS | SageMaker（Training / Batch Transform / Processing / Model Registry）、Step Functions、S3、ECR、SNS、EventBridge |
-| IaC / CI | Terraform（S3 バックエンド、ネイティブロック）、GitHub Actions（OIDC）、ruff、pytest、gitleaks、pip-audit |
+| IaC / CI | Terraform（S3 バックエンド、ネイティブロック）、GitHub Actions（OIDC）、Dependabot、ruff、pytest、gitleaks、pip-audit |
 
 ## 未解決の課題
 
@@ -108,7 +108,7 @@ CI の apply ロールは権限をロール名のプレフィクスで絞って�
 | [docs/serverless.md](docs/serverless.md) | Serverless Inference の失敗と切り分けの記録 |
 | [docs/decisions.md](docs/decisions.md) | 設計判断の一覧（Terraform / CI、SageMaker、パイプライン、通知） |
 | [docs/roadmap.md](docs/roadmap.md) | 移行状況、今後、未解決の課題 |
-| [docs/repository.md](docs/repository.md) | ファイル構成、テスト、セキュリティ |
+| [docs/repository.md](docs/repository.md) | ファイル構成、テスト、セキュリティと公開リポジトリとしての点検 |
 
 ## クイックスタート（ローカル）
 
