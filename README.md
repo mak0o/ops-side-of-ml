@@ -52,8 +52,11 @@
       ├─ Processing Job ────── drift_check ── baseline.json (model.tar.gz から)
       │      └─ ドリフトなし → 終了
       ├─ Training Job ──────── model.tar.gz (S3)
-      └─ Processing Job ────── register_and_promote ── 現行と候補を同じホールドアウトで評価
-                                                         → Approved / Rejected
+      ├─ Processing Job ────── register_and_promote ── 現行と候補を同じホールドアウトで評価
+      │                                                  → Approved / Rejected
+      └─ SNS ───────────────── 現行の劣化 / モデルの入れ替えを通知
+
+    EventBridge ルール ─── 実行が FAILED / TIMED_OUT / ABORTED → SNS → メール
 
 ## セットアップ
 
@@ -394,6 +397,23 @@ Step Functions で、バッチ推論から昇格判定までを 1 つのワー�
 Batch Transform と Training Job は Step Functions の SageMaker 統合（`.sync`）で直接呼び、
 drift_check と登録・昇格判定は Processing Job で動かす。
 
+### 通知
+
+| 事象 | 経路 | 動作確認 |
+|---|---|---|
+| パイプラインの失敗（FAILED / TIMED_OUT / ABORTED） | EventBridge ルール → SNS | 実地で確認（メール受信） |
+| 現行モデルがホールドアウトで下限を割った | ステートマシン → SNS | 定義のみ |
+| モデルが入れ替わった | ステートマシン → SNS | 定義のみ |
+
+「ドリフトを検知したが候補は拒否された」は通知しない。現行が下限を割っていなければ、対処が要らないため。
+
+劣化と入れ替えの通知は、実際に起きるまで動作が保証されていない。現行の v6 はホールドアウトで下限を満たしており、
+入れ替えには McNemar を満たす改善が要るので、意図的に起こすのが難しい。
+
+購読は Terraform の外で登録している。
+
+    aws sns subscribe --topic-arn <alerts_topic_arn> --protocol email --notification-endpoint <address>
+
 ### 2 回の実行結果
 
 **通常データ（学習と同じ母集団からランダム 200 件）**
@@ -549,7 +569,7 @@ v1 が下限を割っていないと分かった時点で、次の分岐を足�
 ドリフトを検知したら再学習し、同じ条件で比べて判定する、という今の構成を維持している。
 
 現行モデルがホールドアウトで下限を割っていた場合は、結果に `current_degraded: true` を記録する。
-候補が拒否され、かつ現行も劣化している状態を黙って放置しないための足がかりで、通知はまだ無い。
+候補が拒否され、かつ現行も劣化している状態を黙って放置しないためで、SNS で通知する（[通知](#通知)）。
 
 ### 3 行の差で昇格が決まった
 
@@ -761,6 +781,7 @@ Batch Transform もそのまま使う（詳細は AWS 側の設計判断を参�
 | `scripts/bootstrap_compare.py` | 現行と候補の差が揺らぎを超えているかを調べる分析用スクリプト（パイプラインからは呼ばない） |
 | `infra/` | Terraform。S3 / IAM / ECR / SageMaker Model Registry |
 | `infra/pipeline.tf` | Step Functions のステートマシン、そのロール、日次スケジュール（無効） |
+| `infra/notifications.tf` | 通知用の SNS トピック、失敗を拾う EventBridge ルール |
 | `infra/bootstrap/` | state バケットを作る。ここだけローカル state |
 | `docker/` | 用途別の Dockerfile（ml-app / mlflow / train / serve / terraform / aws） |
 
@@ -860,7 +881,10 @@ SageMaker では Model Registry の approval status が同じ役割を果たす�
 アイドル時に課金されるリソースは無く、現在の月額は S3 と ECR で 10 円程度。
 
 日次スケジュールを有効にすると、ドリフトが無い日でも Transform と Processing Job で 1 日数円、
-月 100 円前後になる。スケジュールは Terraform で作ってあるが、昇格判定の欠陥が直るまで無効にしている。
+月 100 円前後になる。スケジュールは Terraform で作ってあるが、推論データを `latest/` に置く上流が無いので無効にしている。
+有効にすると毎日データ無しで失敗し、失敗通知が届き続ける。
+
+SNS のメール通知と EventBridge の AWS サービスイベントは、この規模では無料枠に収まる。
 
 ## AWS 側の設計判断
 
@@ -1188,6 +1212,59 @@ apply ロールに `states:*` と `scheduler:*` を足す変更と、ステー�
 `fmt -check` は AWS の認証が要らないので、paths フィルタの無い `ci.yml` に `terraform-fmt` ジョブとして移し、
 必須チェックに加えた。必須でないチェックは、落ちていても誰も止めないので、運用上は無いのと同じだった。
 
+### 失敗の通知はステートマシンの外で拾う
+
+パイプラインの失敗は、Step Functions の実行状態の変化を EventBridge ルールで拾って SNS に送る。
+ステートマシンの中に通知の State を書くと、ステートマシン自体が壊れたとき（定義の誤りで即座に落ちたときなど）に
+通知も一緒に止まる。外から状態変化を見ていれば、どこで落ちても捕まえられる。
+
+劣化と入れ替えの通知はステートマシンの中に置いている。判定結果は `promote.json` に入っていて、
+既存の Choice の流れに State を足すだけで済むため。`register_and_promote.py` から SNS に直接送る方法もあったが、
+スクリプトの責務は判定までにとどめ、通知は制御の流れの側に置いた。
+「判定結果は JSON で返し、分岐はステートマシンが行う」という既存の分担と揃えるため。
+
+### 通知の State に Catch を付けない
+
+SNS への送信が失敗したら、実行はそのまま FAILED で終わる。Catch で握りつぶして Succeed に進めると、
+「通知が届かなかった」ことが誰にも分からなくなる。FAILED で終われば、今度は EventBridge のルールが
+失敗の通知を送る。
+
+昇格の判定自体（Approved / Rejected）は Processing Job の中で確定しているので、通知が失敗しても結果は変わらない。
+
+### SNS の件名は ASCII のみ
+
+SNS の `Subject` は ASCII のみ、100 文字未満という制約がある。日本語を入れると Publish が失敗する。
+件名は英語（`[ops-side-of-ml] model promoted` など）、本文は日本語にしている。
+
+### SNS トピックは暗号化していない
+
+AWS 管理キー（`alias/aws/sns`）で暗号化すると、EventBridge はそのキーを使う権限を持てないので送信に失敗する。
+暗号化するにはカスタマー管理キーが要り、月 1 ドルかかる。通知の本文は実行名と判定の数値だけで機密ではないので、
+暗号化しない判断をした。
+
+トピックポリシーでは、EventBridge からの送信を失敗通知のルールに限定している（`aws:SourceArn`）。
+Step Functions からの送信は同一アカウントなので、SFN ロールの IAM ポリシーだけで足りる。
+
+### 購読は Terraform で管理しない
+
+メールアドレスを公開リポジトリに書けないのと、メールの購読は受信者が確認リンクを押すまで保留になり、
+Terraform ではその確認を完了できないため。トピックだけを Terraform で作り、購読は CLI で 1 回だけ登録する。
+購読は環境ごとに変わる値で、コードとして管理する利点が薄い。
+
+### 失敗通知は安く確かめられる
+
+`input_prefix` に S3 の URI でない文字列を渡すと、Transform の起動時に SageMaker が即座に拒否し、数秒で FAILED になる。
+その前の CreateModel は無料で、失敗経路の後片付けで削除される。
+
+    aws stepfunctions start-execution --state-machine-arn <arn> \
+      --input '{"input_prefix":"invalid","training_input_prefix":"invalid","eval_prefix":"invalid"}'
+
+最初は `eval_prefix` を省けば安く失敗させられると考えたが、そのエラーは RegisterAndPromote に入った時点で起きる。
+その前に Transform・DriftCheck・Train が全て走るので、10 分かかり課金も発生する。失敗させる位置を選ぶ必要がある。
+
+ルールの対象はステートマシンの ARN を文字列で組み立てて指定している。ステートマシンの属性を参照すると、
+定義を変えるたびに plan でルールも変更扱いになるため（scheduler のポリシーと同じ理由）。
+
 ## セキュリティ
 
 - 認証情報は `.env` に外出し（`.env.example` を参照）
@@ -1225,9 +1302,9 @@ AWS
 - [x] Batch Transform → drift_check → 再学習 → 昇格判定 を Step Functions で自動化
 - [x] 昇格判定を同じホールドアウトでの比較にする（現行モデルの劣化も測る）
 - [x] 昇格に差が偶然でないかの条件を設ける（片側 McNemar、α = 0.05）
+- [x] パイプラインの失敗、現行の劣化、モデルの入れ替えを通知する
 - [ ] `latest/` にデータを置く上流を用意する
 - [ ] 日次スケジュールを有効化する（上流が用意できてから）
-- [ ] 現行モデルが下限を割ったときに通知する
 - [ ] Processing Job 用の専用イメージを作る
 - [ ] Serverless Inference での作成失敗を解決する（保留）
 
