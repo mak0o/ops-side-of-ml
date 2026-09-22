@@ -6,7 +6,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    # アクションの更新を 1 つの PR にまとめる
     groups:
-      actions:
+      # マイナー・パッチ版は互換性の問題が出にくいので 1 つの PR にまとめる
+      actions-minor:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
+    # メジャー版はどのグループにも入らず、アクションごとに個別の PR になる。
+    # リリースノートを確認してからマージする
