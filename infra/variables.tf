@@ -23,3 +23,9 @@ variable "pipeline_image_tag" {
   type        = string
   description = "パイプラインが使う train / serve イメージのタグ。image ジョブは同じコミットで両方をビルドするので1つで足りる。"
 }
+
+variable "enable_github_oidc" {
+  type        = bool
+  description = "GitHub Actions から AWS を操作できるようにするか。false にすると OIDC プロバイダを削除し、3 つのロールを誰も引き受けられなくする（ロール自体は残る）"
+  default     = true
+}
